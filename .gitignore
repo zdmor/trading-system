@@ -1,0 +1,15 @@
+# 个人策略配置（不公开）
+config.json
+
+# 行业分类缓存（自动生成）
+industry_cache.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# 系统
+.DS_Store
+Thumbs.db

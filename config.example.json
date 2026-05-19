@@ -1,0 +1,14 @@
+{
+  "002050": {
+    "name": "示例股票",
+    "stop_price": 49.25,
+    "exit_prices": [55.00, 60.77],
+    "supports": [51.30, 49.25],
+    "resistances": [53.88, 55.00, 60.77],
+    "strategy_notes": "可自定义每只股票的止损止盈参数"
+  },
+  "_default": {
+    "risk_pct": 0.02,
+    "max_position_pct": 0.7
+  }
+}

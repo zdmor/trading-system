@@ -1,0 +1,606 @@
+"""
+A股交易系统
+基于趋势跟踪 + 价格行为 + ATR仓位管理
+一键输出交易报告：方向判断、关键价位、仓位计算、操作建议
+
+数据源: 腾讯财经 HTTP API（免费、无需 token、无需登录）
+
+用法:
+  python main.py <股票代码> [账户总资金] [--position 持仓股数,持仓均价]
+
+示例:
+  python main.py 002050 80000 --position 100,51.44
+  python main.py 000858 200000
+"""
+
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import sys
+import json
+import os
+import requests
+import warnings
+warnings.filterwarnings("ignore")
+
+
+# ============================================================
+# 数据获取 (腾讯财经 HTTP API)
+# ============================================================
+
+TENCENT_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={market}{code},day,,,{days},qfq"
+
+
+class DataFetcher:
+    """A股数据获取 — 腾讯财经HTTP API（免费、免token、免登录）"""
+
+    @staticmethod
+    def _market(code):
+        return "sh" if code.startswith("6") else "sz"
+
+    @staticmethod
+    def get_daily(symbol, days=400):
+        """获取日线数据，返回标准化DataFrame"""
+        market = DataFetcher._market(symbol)
+        url = TENCENT_KLINE_URL.format(market=market, code=symbol, days=days)
+
+        r = requests.get(url, timeout=15)
+        data = r.json()
+        if data.get("code") != 0:
+            raise ValueError(f"获取数据失败: {data.get('msg', '未知错误')}")
+
+        klines = data.get("data", {}).get(market + symbol, {}).get("qfqday")
+        if not klines:
+            klines = data.get("data", {}).get(market + symbol, {}).get("day")
+
+        if not klines:
+            raise ValueError(f"未获取到 {symbol} 的行情数据")
+
+        rows = []
+        for k in klines:
+            # [date, open, close, high, low, volume(手)]
+            rows.append({
+                "date": k[0],
+                "open": float(k[1]),
+                "high": float(k[3]),
+                "low": float(k[4]),
+                "close": float(k[2]),
+                "volume": float(k[5]) * 100,
+                "amount": 0.0,
+            })
+
+        df = pd.DataFrame(rows)
+        df["date"] = pd.to_datetime(df["date"])
+        df.sort_values("date", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
+
+    @staticmethod
+    def get_name(symbol):
+        """获取股票名称"""
+        try:
+            market = DataFetcher._market(symbol)
+            url = TENCENT_KLINE_URL.format(market=market, code=symbol, days=1)
+            r = requests.get(url, timeout=10)
+            qt = r.json().get("data", {}).get(market + symbol, {}).get("qt", {}).get(market + symbol, [])
+            if qt and len(qt) > 1 and qt[1]:
+                return qt[1]
+        except Exception:
+            pass
+        return symbol
+
+
+# ============================================================
+# 技术分析
+# ============================================================
+
+class Analyzer:
+    """技术指标计算"""
+
+    @staticmethod
+    def calc_atr(df, period=14):
+        """Wilder's平滑ATR"""
+        df = df.copy()
+        prev = df["close"].shift(1)
+        df["tr"] = np.maximum(
+            df["high"] - df["low"],
+            np.maximum(
+                (df["high"] - prev).abs(),
+                (df["low"] - prev).abs()
+            )
+        )
+        atr = np.zeros(len(df))
+        if len(df) <= period:
+            return df
+        atr[period] = df["tr"].iloc[1:period+1].mean()
+        for i in range(period + 1, len(df)):
+            atr[i] = (atr[i-1] * (period - 1) + df["tr"].iloc[i]) / period
+        df["atr"] = atr
+        df["atr_pct"] = np.where(df["close"] > 0, df["atr"] / df["close"] * 100, 0)
+        return df
+
+    @staticmethod
+    def calc_ma(df, periods):
+        """计算多周期移动平均线"""
+        df = df.copy()
+        for p in periods:
+            df[f"ma{p}"] = df["close"].rolling(window=p).mean()
+        return df
+
+    @staticmethod
+    def detect_levels(df, lookback=60):
+        """基于价格聚类检测关键支撑阻力位"""
+        df = df.iloc[-lookback:]
+        prices = np.concatenate([
+            df["high"].values,
+            df["low"].values
+        ])
+
+        # 价格聚类（简单密度估计）
+        bins = np.linspace(prices.min(), prices.max(), 30)
+        density, edges = np.histogram(prices, bins=bins)
+        centers = (edges[:-1] + edges[1:]) / 2
+
+        # 找密度峰值作为关键价位
+        levels = []
+        for i in range(1, len(density) - 1):
+            if density[i] > density[i-1] and density[i] > density[i+1] and density[i] > 1:
+                levels.append(centers[i])
+
+        current = df["close"].iloc[-1]
+        supports = sorted([l for l in levels if l < current], reverse=True)[:3]
+        resistances = sorted([l for l in levels if l > current])[:3]
+
+        return supports, resistances
+
+
+# ============================================================
+# 仓位计算
+# ============================================================
+
+class PositionSizer:
+    """基于ATR和固定风险的仓位计算"""
+
+    @staticmethod
+    def calculate(account_value, entry_price, stop_price, risk_pct=0.02):
+        """计算建议持仓量（取整到100股）"""
+        risk_per_share = abs(entry_price - stop_price)
+        if risk_per_share < 0.01:
+            return 0, 0, 0
+        max_risk = account_value * risk_pct
+        shares = max_risk / risk_per_share
+        shares = max(0, int(shares / 100) * 100)
+        cost = shares * entry_price
+        actual_risk = shares * risk_per_share
+        return shares, cost, actual_risk
+
+
+# ============================================================
+# 策略引擎
+# ============================================================
+
+class Strategy:
+    """整合趋势、入场、出场、仓位的决策引擎"""
+
+    def __init__(self, df, account_value=80000, current_position=None):
+        self.df = df
+        self.latest = df.iloc[-1]
+        self.account_value = account_value
+        self.current_position = current_position or {"shares": 0, "avg_price": 0}
+        self.price = self.latest["close"]
+
+    def trend_analysis(self):
+        """趋势判断"""
+        result = {"direction": "未知", "strength": 0}
+        has_ma50 = "ma50" in self.df.columns and not pd.isna(self.latest.get("ma50"))
+        has_ma200 = "ma200" in self.df.columns and not pd.isna(self.latest.get("ma200"))
+
+        if has_ma50 and has_ma200:
+            ma50 = self.latest["ma50"]
+            ma200 = self.latest["ma200"]
+            if ma50 > ma200:
+                result["direction"] = "多头"
+                result["strength"] = round((ma50 / ma200 - 1) * 100, 2)
+            else:
+                result["direction"] = "空头"
+                result["strength"] = round((ma50 / ma200 - 1) * 100, 2)
+
+        # 价格相对位置
+        if has_ma50:
+            result["above_ma50"] = self.price > self.latest["ma50"]
+        if has_ma200:
+            result["above_ma200"] = self.price > self.latest["ma200"]
+
+        return result
+
+    def volatility_analysis(self):
+        """波动率分析"""
+        if "atr" not in self.df.columns or pd.isna(self.latest.get("atr")):
+            return {"atr": 0, "atr_pct": 0}
+        return {
+            "atr": round(self.latest["atr"], 2),
+            "atr_pct": round(self.latest["atr_pct"], 1),
+            "lower_band": round(self.price - self.latest["atr"] * 2, 2),
+            "upper_band": round(self.price + self.latest["atr"] * 2, 2),
+        }
+
+    def position_plan(self, stop_price, risk_pct=0.02):
+        """生成加仓/建仓计划"""
+        if self.current_position["shares"] > 0:
+            # 已有持仓：计算加仓
+            shares, cost, risk = PositionSizer.calculate(
+                self.account_value, self.price, stop_price, risk_pct
+            )
+            total_shares = self.current_position["shares"] + shares
+            total_cost = (self.current_position["shares"] * self.current_position["avg_price"]
+                          + cost)
+            avg_price = total_cost / total_shares if total_shares > 0 else 0
+
+            current_value = self.current_position["shares"] * self.price
+            position_ratio = current_value / self.account_value
+
+            return {
+                "current_shares": self.current_position["shares"],
+                "current_avg_price": self.current_position["avg_price"],
+                "current_value": round(current_value, 2),
+                "position_ratio": round(position_ratio * 100, 1),
+                "add_shares": shares,
+                "add_cost": round(cost, 2),
+                "suggested_total": total_shares,
+                "suggested_avg": round(avg_price, 2),
+                "total_ratio": round((current_value + cost) / self.account_value * 100, 1),
+            }
+        else:
+            # 空仓：新建仓位
+            shares, cost, risk = PositionSizer.calculate(
+                self.account_value, self.price, stop_price, risk_pct
+            )
+            return {
+                "current_shares": 0,
+                "current_avg_price": 0,
+                "current_value": 0,
+                "position_ratio": 0,
+                "add_shares": shares,
+                "add_cost": round(cost, 2),
+                "suggested_total": shares,
+                "suggested_avg": round(self.price, 2),
+                "total_ratio": round(cost / self.account_value * 100, 1),
+            }
+
+    def entry_check(self, levels):
+        """检查入场条件是否触发"""
+        result = {
+            "signal": "观望",
+            "reason": [],
+            "conditions": []
+        }
+
+        # 条件1：价格在支撑位附近
+        if levels.get("supports"):
+            nearest_support = levels["supports"][-1] if levels["supports"] else 0
+            support_distance = (self.price - nearest_support) / self.price * 100
+            if 0 <= support_distance < 2:
+                result["conditions"].append(f"[Y] 价格接近支撑 {nearest_support:.2f}（距离 {support_distance:.1f}%）")
+            else:
+                result["conditions"].append(f"[N] 价格距支撑 {nearest_support:.2f} 较远（-{abs(support_distance):.1f}%）" if support_distance < 0 else f"[~] 价格距支撑 {nearest_support:.2f} 较远（{support_distance:.1f}%）")
+
+        # 条件2：趋势为多头
+        trend = self.trend_analysis()
+        if trend["direction"] == "多头":
+            result["conditions"].append(f"[Y] 趋势多头（MA50/MA200差值 {trend['strength']}%）")
+        else:
+            result["conditions"].append("[N] 趋势为空头，不宜做多")
+
+        # 条件3：波动率适中
+        vol = self.volatility_analysis()
+        if vol["atr_pct"] > 0:
+            if 1.5 <= vol["atr_pct"] <= 5:
+                result["conditions"].append(f"[Y] 波动率适中（ATR% {vol['atr_pct']}%）")
+            elif vol["atr_pct"] < 1.5:
+                result["conditions"].append(f"[~] 波动率偏低，注意横盘突破（ATR% {vol['atr_pct']}%）")
+            else:
+                result["conditions"].append(f"[!] 波动率偏高，扩大止损范围（ATR% {vol['atr_pct']}%）")
+
+        # 综合信号
+        buy_conditions = sum(1 for c in result["conditions"] if c.startswith("[Y]"))
+        total_check = len(result["conditions"])
+        if total_check > 0 and buy_conditions >= total_check - 1:
+            result["signal"] = "可入场"
+        elif buy_conditions >= total_check / 2:
+            result["signal"] = "等待确认"
+        else:
+            result["signal"] = "观望"
+
+        return result
+
+
+# ============================================================
+# 报告生成
+# ============================================================
+
+class Report:
+    """生成可读的交易报告"""
+
+    def __init__(self, symbol, name, account_value, price_date=None):
+        self.symbol = symbol
+        self.name = name
+        self.account_value = account_value
+        self.price_date = price_date or datetime.now()
+
+    def _line(self, char="="):
+        """分隔线"""
+        return char * 58
+
+    def _section(self, title):
+        """节标题"""
+        return f"\n  {title}\n  {'-' * 50}"
+
+    def trend_section(self, trend):
+        """趋势分析段落"""
+        lines = [self._section("趋势方向")]
+        lines.append(f"  {trend['direction']}（MA50/MA200差值 {trend['strength']}%）")
+        if "above_ma50" in trend:
+            lines.append(f"  价格在MA50上方: {'是' if trend['above_ma50'] else '否'}")
+        if "above_ma200" in trend:
+            lines.append(f"  价格在MA200上方: {'是' if trend['above_ma200'] else '否'}")
+        lines.append("")
+        return "\n".join(lines)
+
+    def volatility_section(self, vol):
+        """波动率段落"""
+        lines = [self._section("波动率")]
+        if vol["atr"] > 0:
+            lines.append(f"  ATR(14): {vol['atr']}  占比: {vol['atr_pct']}%")
+            lines.append(f"  正常区间: {vol['lower_band']} ~ {vol['upper_band']}")
+        else:
+            lines.append("  数据不足，无法计算")
+        return "\n".join(lines)
+
+    def levels_section(self, levels):
+        """关键价位段落"""
+        lines = [self._section("关键价位")]
+        for r in reversed(levels.get("resistances", [])):
+            lines.append(f"  阻力: {r:.2f}")
+        lines.append(f"  -----------------")
+        lines.append(f"  当前: {levels.get('current', 0):.2f}")
+        lines.append(f"  -----------------")
+        for s in levels.get("supports", []):
+            lines.append(f"  支撑: {s:.2f}")
+        return "\n".join(lines)
+
+    def position_section(self, pos, current_price=None):
+        """仓位段落"""
+        lines = [self._section("仓位管理")]
+        lines.append(f"  账户资金: {self.account_value:,.0f}")
+        lines.append(f"  单笔最大亏损(2%): {self.account_value * 0.02:,.0f}")
+        lines.append(f"  单票上限(70%): {self.account_value * 0.7:,.0f}")
+        lines.append("")
+        if current_price is None:
+            current_price = pos["current_value"] / max(pos["current_shares"], 1) if pos["current_shares"] > 0 else 0
+        if pos["current_shares"] > 0:
+            lines.append(f"  当前持仓: {pos['current_shares']} 股 @ {pos['current_avg_price']}")
+            lines.append(f"  持仓市值: {pos['current_value']:,.0f}  占比: {pos['position_ratio']}%")
+            unrealized = (current_price - pos["current_avg_price"]) * pos["current_shares"]
+            lines.append(f"  浮动盈亏: {unrealized:+,.0f}")
+        else:
+            lines.append("  当前持仓: 空仓")
+        lines.append("")
+        if pos["add_shares"] > 0:
+            lines.append(f"  建议加仓: {pos['add_shares']} 股（约 {pos['add_cost']:,.0f} 元）")
+            lines.append(f"  建议总仓: {pos['suggested_total']} 股（均价 {pos['suggested_avg']}）")
+            lines.append(f"  总仓位占比: {pos['total_ratio']}%")
+        else:
+            lines.append("  暂不建议加仓")
+        return "\n".join(lines)
+
+    def signal_section(self, entry):
+        """信号段落"""
+        lines = [self._section("入场信号")]
+        signal_map = {"可入场": "[Y] 可入场", "等待确认": "[-] 等待确认", "观望": "[N] 观望"}
+        lines.append(f"  {signal_map.get(entry['signal'], entry['signal'])}")
+        lines.append("")
+        for c in entry["conditions"]:
+            lines.append(f"  {c}")
+        return "\n".join(lines)
+
+    def recommendation_section(self, trend, entry, stop_price, exit_prices, pos, current_price=None):
+        """操作建议段落"""
+        lines = [self._section("操作建议")]
+        current_price = current_price or exit_prices[0] * 0.9 if exit_prices else 0
+
+        # 趋势不允许做空
+        if trend["direction"] == "多头":
+            # 有持仓
+            if pos["current_shares"] > 0:
+                lines.append("  [持仓] 继续持有")
+                if entry["signal"] == "可入场" and pos["add_shares"] > 0:
+                    lines.append(f"  [加仓] 条件满足，可加仓 {pos['add_shares']} 股")
+                else:
+                    lines.append("  [加仓] 等待更明确信号")
+            else:
+                if entry["signal"] == "可入场":
+                    lines.append(f"  [建仓] 买入 {pos['add_shares']} 股")
+                else:
+                    lines.append("  [建仓] 等待入场条件满足")
+
+            # 止损
+            total_shares = max(pos["current_shares"], 1) if pos["add_shares"] == 0 else max(pos["current_shares"] + pos["add_shares"], 1)
+            lines.append(f"  [止损] {stop_price:.2f}（亏损约 {abs(stop_price - current_price) * total_shares:,.0f}）")
+
+            # 止盈
+            if exit_prices:
+                lines.append(f"  [止盈一] {exit_prices[0]:.2f}")
+            if len(exit_prices) > 1:
+                lines.append(f"  [止盈二] {exit_prices[1]:.2f}")
+        else:
+            lines.append("  当前为空头趋势，不宜做多")
+
+        return "\n".join(lines)
+
+    def header(self):
+        """报告头部"""
+        lines = [
+            self._line(),
+            f"  {self.name} ({self.symbol})  交易报告",
+            f"  {self.price_date.strftime('%Y-%m-%d %H:%M')}",
+            self._line(),
+        ]
+        return "\n".join(lines)
+
+    def footer(self):
+        """报告尾部"""
+        lines = [
+            "",
+            self._line("-"),
+            "  风险提示: 本报告基于技术分析，仅供参考，不构成投资建议",
+            "  股市有风险，投资需谨慎",
+            self._line(),
+        ]
+        return "\n".join(lines)
+
+
+# ============================================================
+# 主程序
+# ============================================================
+
+def parse_position(arg):
+    """解析持仓参数: --position 100,51.44"""
+    try:
+        parts = arg.split(",")
+        if len(parts) == 2:
+            return {"shares": int(parts[0]), "avg_price": float(parts[1])}
+    except Exception:
+        pass
+    return {"shares": 0, "avg_price": 0}
+
+
+def load_config(symbol):
+    """从config.json加载该股票的个性化策略配置"""
+    config_path = os.path.join(os.path.dirname(__file__), "config.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                configs = json.load(f)
+            return configs.get(symbol, {})
+        except Exception:
+            pass
+    return {}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print("用法:")
+        print("  python main.py <股票代码> [账户总资金] [--position 持仓股数,持仓均价]")
+        print("  python main.py scan [最小成交额(亿)] [--quick]")
+        print("")
+        print("示例:")
+        print("  python main.py 002050              # 三花智控，默认资金8万")
+        print("  python main.py 002050 80000         # 指定资金")
+        print("  python main.py 002050 80000 --position 100,51.44   # 带持仓")
+        print("  python main.py 000858 200000        # 五粮液")
+        print("  python main.py scan                 # 全市场扫描，默认5亿成交额")
+        print("  python main.py scan 10              # 全市场扫描，成交额≥10亿")
+        print("  python main.py scan --quick         # 快速模式(跳过趋势检查)")
+        sys.exit(0)
+
+    # 子命令: scan
+    if sys.argv[1] == "scan":
+        min_amt = 5e8
+        quick = False
+        for arg in sys.argv[2:]:
+            if arg.replace(".", "").isdigit():
+                min_amt = float(arg) * 1e8
+            elif arg == "--quick":
+                quick = True
+        from scanner import run_scanner
+        run_scanner(min_amt, quick)
+        return
+
+    symbol = sys.argv[1].strip()
+    account_value = float(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].replace(".", "").isdigit() else 80000
+
+    # 解析可选参数
+    position = {"shares": 0, "avg_price": 0}
+    if "--position" in sys.argv:
+        idx = sys.argv.index("--position")
+        if idx + 1 < len(sys.argv):
+            position = parse_position(sys.argv[idx + 1])
+
+    # 加载策略配置
+    config = load_config(symbol)
+
+    try:
+        print(f"获取数据 {symbol}...", end=" ", flush=True)
+
+        fetcher = DataFetcher()
+        daily = fetcher.get_daily(symbol, days=400)
+        name = fetcher.get_name(symbol)
+
+        print(f"{name}，{len(daily)} 个交易日")
+        print("分析中...")
+
+        # 价格
+        price = daily["close"].iloc[-1]
+        price_date = daily["date"].iloc[-1]
+
+        # 技术指标
+        daily = Analyzer.calc_atr(daily)
+        daily = Analyzer.calc_ma(daily, [20, 50, 200])
+
+        # 检测关键价位
+        supports, resistances = Analyzer.detect_levels(daily)
+        levels = {
+            "supports": supports,
+            "resistances": resistances,
+            "current": price,
+        }
+
+        # 策略引擎
+        strategy = Strategy(daily, account_value, position)
+        trend = strategy.trend_analysis()
+        vol = strategy.volatility_analysis()
+        entry_check = strategy.entry_check(levels)
+
+        # 止损位（近3个月最低点下方一点）
+        recent_lows = daily["low"].iloc[-60:].min()
+        stop_price = round(recent_lows * 0.985, 2) if recent_lows > 0 else round(price * 0.93, 2)
+
+        # 配置覆盖（如果config.json中有设定，优先使用）
+        if "stop_price" in config:
+            stop_price = config["stop_price"]
+        if "exit_prices" in config:
+            exit_prices = config["exit_prices"]
+        else:
+            exit_prices = [r for r in resistances] if resistances else [round(price * 1.08, 2)]
+        if "supports" in config:
+            levels["supports"] = config["supports"]
+        if "resistances" in config:
+            levels["resistances"] = config["resistances"]
+
+        # 仓位计算
+        pos = strategy.position_plan(stop_price)
+
+        # 生成报告
+        report = Report(symbol, name, account_value, price_date)
+        output = "\n".join([
+            report.header(),
+            report.trend_section(trend),
+            report.volatility_section(vol),
+            report.levels_section(levels),
+            report.position_section(pos, current_price=price),
+            report.signal_section(entry_check),
+            report.recommendation_section(trend, entry_check, stop_price, exit_prices, pos, current_price=price),
+            report.footer(),
+        ])
+        print(output)
+
+    except ValueError as e:
+        print(f"\n错误: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n程序异常: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
