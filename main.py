@@ -39,41 +39,77 @@ class DataFetcher:
         return "sh" if code.startswith("6") else "sz"
 
     @staticmethod
+    def _get_daily_baostock(symbol, days=400):
+        """从BaoStock获取日线（容灾备选）"""
+        import baostock as bs
+        bs.login()
+        try:
+            start = (datetime.now() - timedelta(days=days + 100)).strftime("%Y-%m-%d")
+            end = datetime.now().strftime("%Y-%m-%d")
+            bs_code = f"sz.{symbol}" if DataFetcher._market(symbol) == "sz" else f"sh.{symbol}"
+            rs = bs.query_history_k_data_plus(bs_code,
+                "date,open,high,low,close,volume,amount",
+                start_date=start, end_date=end, frequency="d", adjustflag="2")
+            rows = []
+            while rs.next():
+                row = rs.get_row_data()
+                try:
+                    rows.append({
+                        "date": row[0],
+                        "open": float(row[1]),
+                        "high": float(row[2]),
+                        "low": float(row[3]),
+                        "close": float(row[4]),
+                        "volume": float(row[5]) if row[5] else 0,
+                        "amount": float(row[6]) if row[6] else 0,
+                    })
+                except (ValueError, IndexError):
+                    continue
+            if len(rows) < 30:
+                raise ValueError(f"BaoStock 仅获取到 {len(rows)} 条数据")
+            df = pd.DataFrame(rows)
+            df["date"] = pd.to_datetime(df["date"])
+            df.sort_values("date", inplace=True)
+            df.reset_index(drop=True, inplace=True)
+            return df.tail(days)
+        finally:
+            bs.logout()
+
+    @staticmethod
     def get_daily(symbol, days=400):
-        """获取日线数据，返回标准化DataFrame"""
-        market = DataFetcher._market(symbol)
-        url = TENCENT_KLINE_URL.format(market=market, code=symbol, days=days)
+        """获取日线数据，腾讯 → BaoStock 两级容灾"""
+        # 首选：腾讯
+        try:
+            market = DataFetcher._market(symbol)
+            url = TENCENT_KLINE_URL.format(market=market, code=symbol, days=days)
+            r = requests.get(url, timeout=15)
+            data = r.json()
+            if data.get("code") == 0:
+                klines = data.get("data", {}).get(market + symbol, {}).get("qfqday")
+                if not klines:
+                    klines = data.get("data", {}).get(market + symbol, {}).get("day")
+                if klines and len(klines) >= 30:
+                    rows = []
+                    for k in klines:
+                        rows.append({
+                            "date": k[0],
+                            "open": float(k[1]),
+                            "high": float(k[3]),
+                            "low": float(k[4]),
+                            "close": float(k[2]),
+                            "volume": float(k[5]) * 100,
+                            "amount": 0.0,
+                        })
+                    df = pd.DataFrame(rows)
+                    df["date"] = pd.to_datetime(df["date"])
+                    df.sort_values("date", inplace=True)
+                    df.reset_index(drop=True, inplace=True)
+                    return df
+        except Exception:
+            pass
 
-        r = requests.get(url, timeout=15)
-        data = r.json()
-        if data.get("code") != 0:
-            raise ValueError(f"获取数据失败: {data.get('msg', '未知错误')}")
-
-        klines = data.get("data", {}).get(market + symbol, {}).get("qfqday")
-        if not klines:
-            klines = data.get("data", {}).get(market + symbol, {}).get("day")
-
-        if not klines:
-            raise ValueError(f"未获取到 {symbol} 的行情数据")
-
-        rows = []
-        for k in klines:
-            # [date, open, close, high, low, volume(手)]
-            rows.append({
-                "date": k[0],
-                "open": float(k[1]),
-                "high": float(k[3]),
-                "low": float(k[4]),
-                "close": float(k[2]),
-                "volume": float(k[5]) * 100,
-                "amount": 0.0,
-            })
-
-        df = pd.DataFrame(rows)
-        df["date"] = pd.to_datetime(df["date"])
-        df.sort_values("date", inplace=True)
-        df.reset_index(drop=True, inplace=True)
-        return df
+        # 容灾：BaoStock
+        return DataFetcher._get_daily_baostock(symbol, days)
 
     @staticmethod
     def get_name(symbol):
