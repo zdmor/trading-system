@@ -23,6 +23,8 @@ import requests
 import warnings
 warnings.filterwarnings("ignore")
 
+from data_providers import AkshareProvider
+
 
 # ============================================================
 # 数据获取 (腾讯财经 HTTP API)
@@ -260,13 +262,47 @@ class Strategy:
             "upper_band": round(self.price + self.latest["atr"] * 2, 2),
         }
 
-    def position_plan(self, stop_price, risk_pct=0.02):
-        """生成加仓/建仓计划"""
+    def position_plan(self, stop_price, risk_pct=0.02, entry_status=None, market_health=None, composite_score=None):
+        """生成加仓/建仓计划
+
+        Args:
+            stop_price: 止损价
+            risk_pct: 单笔风险比例（默认2%）
+            entry_status: 入场信号状态，None/未知/观望 时不建议加仓
+            market_health: 大盘健康度，较差时强行禁止加仓
+            composite_score: 多因子综合评分，None时不调整
+        """
+        # 入场信号弱时禁止加仓/建仓
+        signal_blocked = entry_status in (None, "", "未知", "观望")
+
+        # 大盘环境极差时强行禁止（系统性风险硬限制）
+        if market_health and "较差" in market_health:
+            risk_pct = 0
+            signal_blocked = True
+
+        # 多因子评分调整仓位系数（替代原有的大盘一般减半逻辑）
+        if composite_score is not None and not signal_blocked:
+            if composite_score >= 80:
+                pass  # 强加仓，全额风险
+            elif composite_score >= 65:
+                risk_pct = risk_pct * 0.7  # 加仓，7成
+            elif composite_score >= 50:
+                risk_pct = 0  # 持有，不加仓
+                signal_blocked = True
+            elif composite_score >= 30:
+                risk_pct = 0  # 减仓，不加仓
+                signal_blocked = True
+            else:
+                risk_pct = 0  # 离场，不加仓
+                signal_blocked = True
+
         if self.current_position["shares"] > 0:
             # 已有持仓：计算加仓
             shares, cost, risk = PositionSizer.calculate(
                 self.account_value, self.price, stop_price, risk_pct
             )
+            if signal_blocked:
+                shares, cost, risk = 0, 0, 0
             total_shares = self.current_position["shares"] + shares
             total_cost = (self.current_position["shares"] * self.current_position["avg_price"]
                           + cost)
@@ -288,6 +324,12 @@ class Strategy:
             }
         else:
             # 空仓：新建仓位
+            if signal_blocked:
+                return {
+                    "current_shares": 0, "current_avg_price": 0, "current_value": 0,
+                    "position_ratio": 0, "add_shares": 0, "add_cost": 0,
+                    "suggested_total": 0, "suggested_avg": 0, "total_ratio": 0,
+                }
             shares, cost, risk = PositionSizer.calculate(
                 self.account_value, self.price, stop_price, risk_pct
             )
@@ -404,6 +446,25 @@ class Report:
             lines.append(f"  支撑: {s:.2f}")
         return "\n".join(lines)
 
+    def scoring_section(self, scoring_result: dict):
+        """多因子评分段落"""
+        if not scoring_result:
+            return ""
+
+        lines = [self._section("多因子评分")]
+        lines.append(f"  综合评分: {scoring_result['composite_score']}/100 → {scoring_result['action']}")
+        lines.append("")
+        for f in scoring_result.get("factors", []):
+            name_map = {
+                "wyckoff": "威科夫信号", "risk_reward": "盈亏比",
+                "volume": "量能分析", "candlestick": "K线形态",
+                "sector": "板块强度", "momentum": "趋势与动量",
+            }
+            cn = name_map.get(f["key"], f["key"])
+            lines.append(f"  {cn:<8} [{f['weight_pct']:>2}%]  {f['score']:>2}分 {f['label']}  {f['detail']}")
+        lines.append("")
+        return "\n".join(lines)
+
     def position_section(self, pos, current_price=None):
         """仓位段落"""
         lines = [self._section("仓位管理")]
@@ -471,6 +532,45 @@ class Report:
         else:
             lines.append("  当前为空头趋势，不宜做多")
 
+        return "\n".join(lines)
+
+    def financial_section(self, metrics: dict):
+        """基本面指标段落（来自AKShare）"""
+        if not metrics:
+            return ""
+
+        lines = [self._section("基本面指标")]
+        if metrics.get("pe") is not None:
+            lines.append(f"  PE(市盈率): {metrics['pe']:.2f}")
+        if metrics.get("pb") is not None:
+            lines.append(f"  PB(市净率): {metrics['pb']:.2f}")
+        if metrics.get("roe") is not None:
+            lines.append(f"  ROE(净资产收益率): {metrics['roe']:.2f}%")
+        if metrics.get("total_mv") is not None:
+            mv = metrics["total_mv"]
+            lines.append(f"  总市值: {mv/1e8:.2f}亿" if mv > 1e8 else f"  总市值: {mv:.2f}")
+        if metrics.get("float_mv") is not None:
+            fmv = metrics["float_mv"]
+            lines.append(f"  流通市值: {fmv/1e8:.2f}亿" if fmv > 1e8 else f"  流通市值: {fmv:.2f}")
+        lines.append("")
+        return "\n".join(lines)
+
+    def moneyflow_section(self, flow: dict):
+        """资金流向段落（来自AKShare）"""
+        if not flow:
+            return ""
+
+        lines = [self._section("资金流向")]
+        if flow.get("主力净流入") is not None:
+            val = flow["主力净流入"]
+            arr = "↑" if val > 0 else "↓"
+            lines.append(f"  主力净流入: {arr} {abs(val)/1e4:.2f}万")
+        if flow.get("主力净占比") is not None:
+            lines.append(f"  主力净占比: {flow['主力净占比']:.2f}%")
+        if flow.get("超大单净流入") is not None:
+            val = flow["超大单净流入"]
+            lines.append(f"  超大单净流入: {val/1e4:.2f}万" if val != 0 else "  超大单净流入: 0")
+        lines.append("")
         return "\n".join(lines)
 
     def header(self):
@@ -613,18 +713,41 @@ def main():
         if "resistances" in config:
             levels["resistances"] = config["resistances"]
 
-        # 仓位计算
-        pos = strategy.position_plan(stop_price)
+        # AKShare 基本面 & 资金流（技能整合）
+        fin_metrics = AkshareProvider.get_financial_indicators(symbol)
+        moneyflow = AkshareProvider.get_stock_moneyflow(symbol)
+
+        # 多因子评分
+        scoring_result = None
+        try:
+            from scoring import StockScorer
+            scorer = StockScorer(
+                df=daily, price=price, trend=trend, vol=vol, levels=levels,
+                stop_price=stop_price, exit_prices=exit_prices,
+                position=position, symbol=symbol,
+            )
+            scoring_result = scorer.compute()
+        except Exception:
+            pass
+
+        # 仓位计算（带评分）
+        pos = strategy.position_plan(
+            stop_price, entry_status=entry_check.get("signal"),
+            composite_score=scoring_result["composite_score"] if scoring_result else None
+        )
 
         # 生成报告
         report = Report(symbol, name, account_value, price_date)
         output = "\n".join([
             report.header(),
+            report.financial_section(fin_metrics),
+            report.moneyflow_section(moneyflow),
             report.trend_section(trend),
             report.volatility_section(vol),
             report.levels_section(levels),
             report.position_section(pos, current_price=price),
             report.signal_section(entry_check),
+            report.scoring_section(scoring_result),
             report.recommendation_section(trend, entry_check, stop_price, exit_prices, pos, current_price=price),
             report.footer(),
         ])

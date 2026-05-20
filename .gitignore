@@ -1,15 +1,37 @@
-# 个人策略配置（不公开）
-config.json
-
-# 行业分类缓存（自动生成）
-industry_cache.json
+# Claude Code internal
+.claude/
 
 # Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 *.egg-info/
+dist/
+build/
 
-# 系统
+# Options
+last_picks.json
+skills-lock.json
+
+# Screenshots
+*.jpg
+*.png
+
+# Data & Cache
+industry_cache.json
+
+# Config with potential secrets (webhook URLs, API keys)
+config/scanner.yaml
+config.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
 .DS_Store
 Thumbs.db
+
+# Environment
+.env
+.venv/
+venv/

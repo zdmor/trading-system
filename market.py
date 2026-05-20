@@ -7,6 +7,8 @@ import requests
 import numpy as np
 from datetime import datetime, time
 
+from data_providers import AkshareProvider
+
 
 class MarketAnalyzer:
 
@@ -209,6 +211,33 @@ class MarketAnalyzer:
         )
 
     # ───────────────────────────── 大盘健康度 ─────────────────────────────
+
+    # ───────────────────────────── 宏观数据（AKShare整合） ─────────────────────────────
+
+    @staticmethod
+    def get_macro_context():
+        """宏观经济仪表盘摘要"""
+        try:
+            return AkshareProvider.get_macro_dashboard()
+        except Exception:
+            return {}
+
+    @staticmethod
+    def get_northbound_context():
+        """北向资金当日流向"""
+        try:
+            return AkshareProvider.get_northbound_flow()
+        except Exception:
+            return {}
+
+    @staticmethod
+    def get_concept_boards_top(n=10):
+        """当日概念板块涨幅榜"""
+        try:
+            boards = AkshareProvider.get_concept_boards()
+            return [(b.get("板块名称", ""), b.get("涨跌幅", 0)) for b in boards[:n]]
+        except Exception:
+            return []
 
     # ───────────────────────────── 交易日/交易时间判断 ─────────────────────────────
 

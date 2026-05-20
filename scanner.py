@@ -15,8 +15,41 @@ import time
 import json
 import os
 import sys
+import yaml
 import warnings
 warnings.filterwarnings("ignore")
+
+from data_providers import AkshareProvider
+
+
+# ============================================================
+# 配置加载
+# ============================================================
+
+_CONFIG_DIR = os.path.join(os.path.dirname(__file__), "config")
+
+def _load_yaml(name):
+    path = os.path.join(_CONFIG_DIR, name)
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            return yaml.safe_load(f)
+    return {}
+
+# 全局缓存，避免重复读文件
+_PATTERNS_CFG = None
+_SCANNER_CFG = None
+
+def get_patterns_config():
+    global _PATTERNS_CFG
+    if _PATTERNS_CFG is None:
+        _PATTERNS_CFG = _load_yaml("patterns.yaml")
+    return _PATTERNS_CFG
+
+def get_scanner_config():
+    global _SCANNER_CFG
+    if _SCANNER_CFG is None:
+        _SCANNER_CFG = _load_yaml("scanner.yaml")
+    return _SCANNER_CFG
 
 
 # ============================================================
@@ -25,6 +58,15 @@ warnings.filterwarnings("ignore")
 
 class WyckoffAnalyzer:
     """检测多种威科夫交易形态"""
+
+    _cfg_cache = {}
+
+    @classmethod
+    def _cfg(cls, section):
+        """读取 patterns.yaml 中指定段落的配置"""
+        if section not in cls._cfg_cache:
+            cls._cfg_cache[section] = get_patterns_config().get(section, {})
+        return cls._cfg_cache[section]
 
     @staticmethod
     def _avg(arr):
@@ -90,58 +132,57 @@ class WyckoffAnalyzer:
     # -------------------------------------------------------
     @classmethod
     def detect_spring(cls, closes, highs, lows, volumes, trend):
-        """
-        弹簧：价格跌破近期支撑，快速收回，伴随放量
-        只在多头/盘整趋势中有效
-        """
-        if trend == "空头" or trend == "错误":
+        """弹簧：价格跌破近期支撑，快速收回，伴随放量"""
+        cfg = cls._cfg("spring")
+        if not cfg.get("enabled", True) or trend in cfg.get("exclude_trends", ["空头", "错误"]):
             return None
+        sw = cfg.get("support_window", [-12, -3])
+        pr = cfg.get("price_range", [0.95, 1.15])
+        vbw = cfg.get("volume_baseline_window", [-15, -3])
+        dw = cfg.get("detect_window", [-3, None])
+        thr = cfg.get("thresholds", {})
 
-        support_data = lows[-12:-3]
-        if len(support_data) < 3:
-            return None
-        support = float(min(support_data))
-
+        support = float(min(lows[sw[0]:sw[1]])) if len(lows) >= abs(sw[0]) else 1
         cur = float(closes[-1])
-        if cur > support * 1.15 or cur < support * 0.95:
+        if cur > support * pr[1] or cur < support * pr[0]:
             return None
 
-        bg_vol = cls._avg(volumes[-15:-3])
+        bg_vol = cls._avg(volumes[vbw[0]:vbw[1]])
+        lookback = lows[dw[0]:dw[1]]
+        closes_lb = closes[dw[0]:dw[1]]
+
+        scoring = cfg.get("scoring", {})
+        depth_cfg = scoring.get("depth", [])
+        vol_cfg = scoring.get("volume_ratio", [])
+        bounce_cfg = scoring.get("bounce", [])
+        nd_confirm = scoring.get("next_day_confirm", 15)
 
         best = None
-        for i in range(len(lows[-3:])):
-            low = float(lows[-3:][i])
-            close = float(closes[-3:][i])
-            vol = float(volumes[-3:][i])
+        for i in range(len(lookback)):
+            low = float(lookback[i])
+            close = float(closes_lb[i])
+            vol = float(volumes[-3:][i]) if len(volumes) >= 3 else 1
 
             if low >= support * 0.997 or close <= support:
                 continue
 
             depth = (support - low) / support * 100
-            vratio = vol / bg_vol
+            vratio = vol / bg_vol if bg_vol > 0 else 1
             bounce = (close - low) / low * 100
 
             score = 0
             parts = []
-            if depth >= 4: score += 25; parts.append(f"深探{depth:.1f}%")
-            elif depth >= 2: score += 20; parts.append(f"中探{depth:.1f}%")
-            else: score += 12; parts.append(f"浅探{depth:.1f}%")
-
-            if vratio >= 2.5: score += 25; parts.append("巨量")
-            elif vratio >= 1.8: score += 20; parts.append("放量")
-            elif vratio >= 1.2: score += 12; parts.append("微放量")
-            else: score += 5; parts.append("量平")
-
-            if bounce >= 5: score += 25; parts.append(f"强弹{bounce:.1f}%")
-            elif bounce >= 3: score += 18; parts.append(f"中弹{bounce:.1f}%")
-            elif bounce >= 1.5: score += 10; parts.append(f"弱弹{bounce:.1f}%")
-
-            if i + 1 < len(closes[-3:]):
-                nc = float(closes[-3:][i + 1])
-                if nc > close: score += 15; parts.append("确认")
+            for d in depth_cfg:
+                if depth >= d[0]: score += d[1]; parts.append(d[2].format(depth=depth)); break
+            for v in vol_cfg:
+                if vratio >= v[0]: score += v[1]; parts.append(v[2]); break
+            for b in bounce_cfg:
+                if bounce >= b[0]: score += b[1]; parts.append(b[2].format(bounce=bounce)); break
+            if i + 1 < len(closes_lb) and float(closes_lb[i+1]) > close:
+                score += nd_confirm; parts.append("确认")
 
             if score > (best[1] if best else 0):
-                sig = "Spring" if score >= 55 else "弱Spring"
+                sig = "Spring" if score >= thr.get("strong_signal", 55) else thr.get("weak_label", "弱Spring")
                 best = (sig, score, " | ".join(parts))
 
         return best
@@ -151,224 +192,216 @@ class WyckoffAnalyzer:
     # -------------------------------------------------------
     @classmethod
     def detect_sos(cls, closes, highs, lows, volumes, trend):
-        """
-        强势信号：大阳线 + 放量 + 高位收盘
-        表明需求强劲，供应被吸收
-        """
-        if trend != "多头":
+        """强势信号：大阳线 + 放量 + 高位收盘"""
+        cfg = cls._cfg("sos")
+        if not cfg.get("enabled", True) or trend in cfg.get("exclude_trends", ["空头"]):
             return None
-        if len(closes) < 50:
+        if len(closes) < cfg.get("min_bars", 50):
             return None
 
-        # ---- 位阶保护：SOS 不应出现在远离 MA200 的高位（Buying Climax） ----
-        if len(closes) >= 200:
+        # 位阶保护
+        mp = cfg.get("ma200_bias_protection", {})
+        if mp.get("enabled", True) and len(closes) >= 200:
             ma50 = float(np.mean(closes[-50:]))
             ma200 = float(np.mean(closes))
-            if ma200 > 0:
-                bias_200 = (ma50 - ma200) / ma200 * 100
-                # 超过 25% 说明已在高位，此时的放量可能是派发而非 SOS
-                if bias_200 > 25:
-                    return None
+            if ma200 > 0 and (ma50 - ma200) / ma200 * 100 > mp.get("max_bias_pct", 25):
+                return None
 
-        # 只用最近一根K线检测
-        today_o = float(closes[-2])  # 昨日收盘 = 今日开盘（简化）
+        vbw = cfg.get("volume_baseline_window", [-20, -1])
+        rbw = cfg.get("range_baseline_window", [-20, -1])
+        scoring = cfg.get("scoring", {})
+        pc_cfg = scoring.get("price_pct", [])
+        vr_cfg = scoring.get("volume_ratio", [])
+        cp_cfg = scoring.get("close_position", [])
+        rr_cfg = scoring.get("range_ratio", [])
+        min_score = cfg.get("thresholds", {}).get("min_score", 50)
+
+        today_o = float(closes[-2])
         today_c = float(closes[-1])
         today_h = float(highs[-1])
         today_l = float(lows[-1])
         today_v = float(volumes[-1])
 
-        # 必须是阳线
         if today_c <= today_o:
             return None
 
-        bg_vol = cls._avg(volumes[-20:-1])
-        bg_range = cls._avg([highs[i] - lows[i] for i in range(-20, -1)])
-
-        # 阳线实体
-        body = today_c - today_o
+        bg_vol = cls._avg(volumes[vbw[0]:vbw[1]]) if vbw[1] else cls._avg(volumes[vbw[0]:])
+        bg_range = cls._avg([highs[i] - lows[i] for i in range(rbw[0], rbw[1])])
         total_range = today_h - today_l
         if total_range < 0.01:
             return None
-        pos_in_range = (today_c - today_l) / total_range  # 收盘在K线中的位置(0~1)
 
-        vratio = today_v / bg_vol
+        pos_in_range = (today_c - today_l) / total_range
+        vratio = today_v / bg_vol if bg_vol > 0 else 1
         range_ratio = total_range / bg_range if bg_range > 0 else 0
+        pct = (today_c - today_o) / today_o * 100
 
         score = 0
         parts = []
-
-        # 涨幅
-        pct = (today_c - today_o) / today_o * 100
-        if pct >= 5: score += 25; parts.append(f"大涨{pct:.1f}%")
-        elif pct >= 3: score += 20; parts.append(f"中涨{pct:.1f}%")
-        elif pct >= 1.5: score += 12; parts.append(f"小涨{pct:.1f}%")
-        else: return None  # 涨幅太小不算SOS
-
-        # 量
-        if vratio >= 2.0: score += 25; parts.append("放量")
-        elif vratio >= 1.5: score += 18; parts.append("增量")
-        elif vratio >= 1.2: score += 10; parts.append("微增")
-        else: score += 5; parts.append("量平")
-
-        # 高位收盘
-        if pos_in_range >= 0.8: score += 25; parts.append("收高位")
-        elif pos_in_range >= 0.6: score += 15; parts.append("收中上")
-        else: score += 5; parts.append("收中位")
-
-        # 振幅
-        if range_ratio >= 1.5: score += 15; parts.append("宽幅")
-        elif range_ratio >= 1.0: score += 8; parts.append("正常幅")
-
-        # 价格在MA50之上
+        matched = False
+        for d in pc_cfg:
+            if pct >= d[0]: score += d[1]; parts.append(d[2].format(pct=pct)); matched = True; break
+        if not matched:
+            return None
+        for v in vr_cfg:
+            if vratio >= v[0]: score += v[1]; parts.append(v[2]); break
+        for c in cp_cfg:
+            if pos_in_range >= c[0]: score += c[1]; parts.append(c[2]); break
+        for r in rr_cfg:
+            if range_ratio >= r[0]: score += r[1]; parts.append(r[2]); break
         if len(closes) >= 50 and today_c > np.mean(closes[-50:]):
-            score += 10; parts.append("趋势上")
+            score += scoring.get("above_ma50", 10); parts.append("趋势上")
 
-        if score >= 50:
-            return ("SOS", score, " | ".join(parts))
-        return None
+        return ("SOS", score, " | ".join(parts)) if score >= min_score else None
 
     # -------------------------------------------------------
     # LPS Last Point of Support 最后支撑点
     # -------------------------------------------------------
     @classmethod
     def detect_lps(cls, closes, highs, lows, volumes, trend):
-        """
-        最后支撑点：放量上攻后，缩量回调至支撑附近
-        威科夫最佳入场点
-        """
-        if trend != "多头":
+        """最后支撑点：放量上攻后，缩量回调至支撑附近"""
+        cfg = cls._cfg("lps")
+        if not cfg.get("enabled", True) or trend in cfg.get("exclude_trends", ["空头"]):
             return None
-        if len(closes) < 30:
+        if len(closes) < cfg.get("min_bars", 30):
             return None
 
-        # 近期支撑（类似Spring的支撑计算）
-        support = float(min(lows[-12:-3]))
+        sw = cfg.get("support_window", [-12, -3])
+        pr = cfg.get("price_range", [1.0, 1.05])
+        surge_win = cfg.get("surge_window", [-10, -3])
+        surge_bw = cfg.get("surge_baseline_window", [-25, -10])
+        surge_vr = cfg.get("surge_volume_ratio", 1.3)
+        surge_range = cfg.get("surge_confirm_range", 5)
+        scoring = cfg.get("scoring", {})
+        thr = cfg.get("thresholds", {})
 
+        support = float(min(lows[sw[0]:sw[1]]))
         cur = float(closes[-1])
-        # 价格必须在支撑附近（支撑上方0~5%）
-        if not (support <= cur <= support * 1.05):
+        if not (support * pr[0] <= cur <= support * pr[1]):
             return None
 
-        # 最近3天是否有过放量上涨（LPS的前提是之前有SOS或上涨）
-        recent_volumes = volumes[-10:-3]
-        bg_vol = cls._avg(volumes[-25:-10])
+        # 前置放量上涨检测
+        bg_vol = cls._avg(volumes[surge_bw[0]:surge_bw[1]])
         had_upsurge = any(
-            float(volumes[-10:-3][i]) > bg_vol * 1.3 and
-            float(closes[-10:-3][i]) > float(closes[-11:-4][i])
-            for i in range(min(5, len(volumes[-10:-3])))
-        )
-
+            float(volumes[surge_win[0]:surge_win[1]][i]) > bg_vol * surge_vr
+            and float(closes[surge_win[0]:surge_win[1]][i]) > float(closes[surge_win[0]-1:surge_win[1]-1][i])
+            for i in range(min(surge_range, len(volumes[surge_win[0]:surge_win[1]])))
+        ) if bg_vol > 0 else False
         if not had_upsurge:
             return None
 
-        # 当前成交量应该萎缩
         today_v = float(volumes[-1])
         vratio = today_v / bg_vol if bg_vol > 0 else 1
+        vr_cfg = scoring.get("volume_ratio", [])
 
-        score = 30  # 基础分
+        score = thr.get("base_score", 30)
         parts = []
+        for v in vr_cfg:
+            if vratio <= v[0]:
+                score += v[1]
+                parts.append(v[2])
+                break
+        if not parts:
+            parts.append("量平")
 
-        # 缩量
-        if vratio <= 0.5: score += 30; parts.append("地量")
-        elif vratio <= 0.7: score += 22; parts.append("缩量")
-        elif vratio <= 0.9: score += 12; parts.append("微缩")
-        else: parts.append("量平")
-
-        # K线形态：小实体更好
         body = abs(float(closes[-1]) - float(closes[-2]))
         avg_body = cls._avg([abs(closes[i] - closes[i-1]) for i in range(-10, -1)])
-        if body < avg_body * 0.6: score += 15; parts.append("小实体")
-        elif body < avg_body * 0.9: score += 8; parts.append("中实体")
+        br_cfg = scoring.get("body_ratio", [])
+        for b in br_cfg:
+            if body < avg_body * b[0]:
+                score += b[1]; parts.append(b[2]); break
 
-        # 支撑效力：之前该支撑是否被Spring确认过
-        support_tested = any(float(lows[i]) < support and float(closes[i]) > support
-                             for i in range(-15, 0))
-        if support_tested: score += 15; parts.append("支撑验证")
+        st_win = scoring.get("support_tested_window", [-15, 0])
+        if any(float(lows[i]) < support and float(closes[i]) > support for i in range(st_win[0], st_win[1] or 0)):
+            score += scoring.get("support_tested_score", 15); parts.append("支撑验证")
 
-        # 价格波动收窄
-        recent_range = float(max(highs[-5:])) - float(min(lows[-5:]))
-        older_range = float(max(highs[-10:-5])) - float(min(lows[-10:-5]))
-        if older_range > 0 and recent_range < older_range * 0.7:
-            score += 10; parts.append("波幅收窄")
+        rn = scoring.get("range_narrowing", {})
+        if rn:
+            rnw = rn.get("window", [-10, -5, -5, 0])
+            recent_r = float(max(highs[rnw[2]:rnw[3]])) - float(min(lows[rnw[2]:rnw[3]]))
+            older_r = float(max(highs[rnw[0]:rnw[1]])) - float(min(lows[rnw[0]:rnw[1]]))
+            if older_r > 0 and recent_r < older_r * rn.get("ratio_threshold", 0.7):
+                score += rn.get("score", 10); parts.append("波幅收窄")
 
         detail = " | ".join(parts) if parts else ""
-        sig = "LPS" if score >= 60 else "弱LPS"
-        return (sig, score, detail) if score >= 40 else None
+        sig = "LPS" if score >= thr.get("strong_signal", 60) else thr.get("weak_label", "弱LPS")
+        return (sig, score, detail) if score >= thr.get("min_score", 40) else None
 
     # -------------------------------------------------------
     # Upthrust 上冲回落（UT/UTAD）
     # -------------------------------------------------------
     @classmethod
     def detect_upthrust(cls, closes, highs, lows, volumes, trend):
-        """
-        上冲回落：价格突破阻力后迅速收回，放量
-        威科夫做空/派发信号
-        """
-        # Upthrust 在多头趋势末期也有效，不限制趋势
-        if len(closes) < 20:
+        """上冲回落：价格突破阻力后迅速收回，放量"""
+        cfg = cls._cfg("upthrust")
+        if not cfg.get("enabled", True):
+            return None
+        if len(closes) < cfg.get("min_bars", 20):
             return None
 
-        # 阻力：过去12天的最高点（排除最近3天）
-        resistance = float(max(highs[-12:-3]))
+        rw = cfg.get("resistance_window", [-12, -3])
+        pr = cfg.get("price_range", [0.97, 1.03])
+        vbw = cfg.get("volume_baseline_window", [-15, -3])
+        dw = cfg.get("detect_window", [-3, None])
+        scoring = cfg.get("scoring", {})
+        thr = cfg.get("thresholds", {})
+
+        resistance = float(max(highs[rw[0]:rw[1]]))
         if resistance <= 0:
             return None
 
         cur = float(closes[-1])
-        # 价格必须在阻力附近（阻力下方3%到上方3%）
-        if not (resistance * 0.97 <= cur <= resistance * 1.03):
+        if not (resistance * pr[0] <= cur <= resistance * pr[1]):
             return None
 
-        bg_vol = cls._avg(volumes[-15:-3])
+        bg_vol = cls._avg(volumes[vbw[0]:vbw[1]])
+        lookback_h = highs[dw[0]:dw[1]]
+        lookback_c = closes[dw[0]:dw[1]]
+        lookback_l = lows[dw[0]:dw[1]]
+
+        thrust_cfg = scoring.get("thrust", [])
+        vr_cfg = scoring.get("volume_ratio", [])
+        cp_cfg = scoring.get("close_position", [])
+        uw_ratio = scoring.get("upper_wick_ratio", 0.4)
+        uw_score = scoring.get("upper_wick_score", 15)
+        nd_score = scoring.get("next_day_confirm", 10)
+        base = scoring.get("base_score", 30)
+        strong = thr.get("strong_signal", 55)
+        weak = thr.get("weak_label", "弱Upthrust")
 
         best = None
-        for i in range(len(highs[-3:])):
-            high = float(highs[-3:][i])
-            close = float(closes[-3:][i])
-            low = float(lows[-3:][i])
-            vol = float(volumes[-3:][i])
+        for i in range(len(lookback_h)):
+            high = float(lookback_h[i])
+            close = float(lookback_c[i])
+            low = float(lookback_l[i])
+            vol = float(volumes[dw[0]:dw[1]][i]) if len(volumes) >= abs(dw[0]) else 1
 
-            # 必须突破过阻力
             if high < resistance:
                 continue
-
-            # 收盘必须回到阻力之下或附近（上冲失败）
             if close > resistance * 1.01:
                 continue
 
-            vratio = vol / bg_vol
+            vratio = vol / bg_vol if bg_vol > 0 else 1
             total_range = high - low
             pos_in_range = (close - low) / total_range if total_range > 0 else 0.5
-
-            score = 30  # 基础分
-            parts = []
-
-            # 突破幅度
             thrust = (high - resistance) / resistance * 100
-            if thrust >= 3: score += 20; parts.append(f"深探{thrust:.1f}%")
-            elif thrust >= 1.5: score += 15; parts.append(f"中探{thrust:.1f}%")
-            else: score += 8; parts.append(f"浅探{thrust:.1f}%")
 
-            # 量
-            if vratio >= 2.0: score += 25; parts.append("巨量")
-            elif vratio >= 1.5: score += 18; parts.append("放量")
-            elif vratio >= 1.2: score += 10; parts.append("微放量")
-            else: score += 5; parts.append("量平")
-
-            # 低位收盘（上冲回落的特征）
-            if pos_in_range <= 0.3: score += 20; parts.append("收低位")
-            elif pos_in_range <= 0.5: score += 10; parts.append("收中低")
-
-            # 上影线
-            upper_wick = high - max(close, float(closes[-3:][i-1]) if i > 0 else close)
-            if upper_wick > total_range * 0.4: score += 15; parts.append("长上影")
-
-            # 次日确认
-            if i + 1 < len(closes[-3:]):
-                nc = float(closes[-3:][i + 1])
-                if nc < close: score += 10; parts.append("次日跌")
+            score = base
+            parts = []
+            for d in thrust_cfg:
+                if thrust >= d[0]: score += d[1]; parts.append(d[2].format(thrust=thrust)); break
+            for v in vr_cfg:
+                if vratio >= v[0]: score += v[1]; parts.append(v[2]); break
+            for c in cp_cfg:
+                if pos_in_range <= c[0]: score += c[1]; parts.append(c[2]); break
+            upper_wick = high - max(close, float(lookback_c[i-1]) if i > 0 else close)
+            if upper_wick > total_range * uw_ratio:
+                score += uw_score; parts.append("长上影")
+            if i + 1 < len(lookback_c) and float(lookback_c[i+1]) < close:
+                score += nd_score; parts.append("次日跌")
 
             if score > (best[1] if best else 0):
-                sig = "Upthrust" if score >= 55 else "弱Upthrust"
+                sig = "Upthrust" if score >= strong else weak
                 best = (sig, score, " | ".join(parts))
 
         return best
@@ -378,59 +411,53 @@ class WyckoffAnalyzer:
     # -------------------------------------------------------
     @classmethod
     def detect_evr(cls, closes, highs, lows, volumes, trend):
-        """
-        努力无结果：放量但价格窄幅波动
-        表明需求正在吸收供应（吸筹特征），或高位派发
-        只在多头/盘整趋势中有效
-        """
-        if trend == "空头" or trend == "错误":
+        """努力无结果：放量但价格窄幅波动"""
+        cfg = cls._cfg("evr")
+        if not cfg.get("enabled", True) or trend in cfg.get("exclude_trends", ["空头", "错误"]):
             return None
-        if len(closes) < 30:
+        if len(closes) < cfg.get("min_bars", 30):
             return None
 
-        # 位阶保护：远离 MA200 的高位放量滞涨按派发处理
-        if len(closes) >= 200:
+        mp = cfg.get("ma200_bias_protection", {})
+        if mp.get("enabled", True) and len(closes) >= 200:
             ma200 = float(np.mean(closes))
-            if ma200 > 0:
-                cur = float(closes[-1])
-                if (cur - ma200) / ma200 > 0.3:
-                    return None
+            if ma200 > 0 and (float(closes[-1]) - ma200) / ma200 > mp.get("max_bias_pct", 30) / 100:
+                return None
 
-        bg_vol = cls._avg(volumes[-20:-1])
+        vbw = cfg.get("volume_baseline_window", [-20, -1])
+        dw = cfg.get("detect_window", [-3, 0])
+        min_vr = cfg.get("min_volume_ratio", 1.5)
+        max_pc = cfg.get("max_price_change", 2.5)
+        scoring = cfg.get("scoring", {})
+        vr_cfg = scoring.get("volume_ratio", [])
+        rn = scoring.get("range_narrowing", {})
+
+        bg_vol = cls._avg(volumes[vbw[0]:vbw[1]])
         best = None
 
-        # 检测最近3天是否出现"放量但价格不动"
-        for i in range(-3, 0):
-            vol = float(volumes[i])
+        for idx in range(dw[0], dw[1] or 0):
+            vol = float(volumes[idx])
             vratio = vol / bg_vol if bg_vol > 0 else 0
-            if vratio < 1.5:
-                continue  # 量不够大不算努力
+            if vratio < min_vr:
+                continue
+            pct = (float(closes[idx]) - float(closes[idx-1])) / float(closes[idx-1]) * 100
+            if abs(pct) > max_pc:
+                continue
 
-            # 当日涨跌幅
-            pct = (float(closes[i]) - float(closes[i-1])) / float(closes[i-1]) * 100
-            if abs(pct) > 2.5:
-                continue  # 价格变动太大，说明有结果
-
-            score = 50
+            score = scoring.get("base_score", 50)
             parts = []
+            for v in vr_cfg:
+                if vratio >= v[0]: score += v[1]; parts.append(v[2].format(vratio=vratio)); break
+            parts.append("抗跌" if pct > 0 else "滞涨")
 
-            if vratio >= 2.5: score += 20; parts.append(f"巨量{vratio:.1f}倍")
-            elif vratio >= 2.0: score += 15; parts.append(f"放量{vratio:.1f}倍")
-            else: score += 8; parts.append(f"增量{vratio:.1f}倍")
-
-            if pct > 0: parts.append("抗跌")
-            else: parts.append("滞涨")
-
-            # K线振幅小，确认窄幅
-            k_range = float(highs[i]) - float(lows[i])
-            avg_range = cls._avg([highs[j] - lows[j] for j in range(-20, -1)])
-            if avg_range > 0 and k_range < avg_range * 0.7:
-                score += 15; parts.append("窄幅")
-
-            if i == -1:
-                # 当日确认收盘不弱于前日
-                if float(closes[-1]) >= float(closes[-2]) * 0.99:
-                    score += 10; parts.append("确认")
+            if rn:
+                rnw = rn.get("window", [-20, -1])
+                k_range = float(highs[idx]) - float(lows[idx])
+                avg_r = cls._avg([highs[j] - lows[j] for j in range(rnw[0], rnw[1])])
+                if avg_r > 0 and k_range < avg_r * rn.get("ratio_threshold", 0.7):
+                    score += rn.get("score", 15); parts.append("窄幅")
+            if idx == -1 and float(closes[-1]) >= float(closes[-2]) * scoring.get("confirm_threshold", 0.99):
+                score += scoring.get("confirm_score", 10); parts.append("确认")
 
             if score > (best[1] if best else 0):
                 best = ("EVR", score, " | ".join(parts))
@@ -442,69 +469,69 @@ class WyckoffAnalyzer:
     # -------------------------------------------------------
     @classmethod
     def detect_compression(cls, closes, highs, lows, volumes, trend):
-        """
-        压缩蓄势：ATR 收窄 + 缩量，变盘前夜
-        价格在收敛区间内整理，波动率持续下降
-        """
-        if trend == "错误":
+        """压缩蓄势：ATR 收窄 + 缩量，变盘前夜"""
+        cfg = cls._cfg("compression")
+        if not cfg.get("enabled", True) or trend in cfg.get("exclude_trends", ["错误"]):
             return None
-        if len(closes) < 40:
+        if len(closes) < cfg.get("min_bars", 40):
             return None
 
-        # 计算每日真实波幅
         tr = []
         for i in range(1, len(closes)):
-            h = float(highs[i])
-            l_ = float(lows[i])
-            pc = float(closes[i-1])
+            h, l_, pc = float(highs[i]), float(lows[i]), float(closes[i-1])
             tr.append(max(h - l_, abs(h - pc), abs(l_ - pc)))
-        if len(tr) < 25:
+        if len(tr) < cfg.get("min_tr_bars", 25):
             return None
 
-        # 近期 ATR vs 历史 ATR（均以百分比表示）
-        recent_tr = tr[-10:]
-        hist_tr = tr[-30:-10]
-        recent_avg = np.mean(recent_tr) / float(closes[-1]) * 100 if len(recent_tr) > 0 else 0
-        hist_avg = np.mean(hist_tr) / float(closes[-1]) * 100 if len(hist_tr) > 0 else 0
+        rtw = cfg.get("recent_tr_window", 10)
+        htw = cfg.get("hist_tr_window", [30, 10])
+        vbw = cfg.get("volume_baseline_window", [-30, -10])
+        max_cr = cfg.get("max_compress_ratio", 0.75)
+        max_vr = cfg.get("max_vol_ratio", 0.8)
+        max_viol = cfg.get("max_violations", 2)
+        scoring = cfg.get("scoring", {})
+        thr = cfg.get("thresholds", {})
 
+        recent_tr = tr[-rtw:]
+        hist_tr = tr[-htw[0]:-htw[1]] if len(tr) >= htw[0] else tr[:htw[0]-htw[1]]
+        recent_avg = np.mean(recent_tr) / float(closes[-1]) * 100 if recent_tr else 0
+        hist_avg = np.mean(hist_tr) / float(closes[-1]) * 100 if hist_tr else 0
         if hist_avg <= 0:
             return None
 
         compress_ratio = recent_avg / hist_avg
-        if compress_ratio > 0.75:
-            return None  # 波幅不够收敛
-
-        # 量能萎缩
-        bg_vol = cls._avg(volumes[-30:-10])
-        recent_vol = cls._avg(volumes[-10:])
-        vol_ratio = recent_vol / bg_vol if bg_vol > 0 else 1
-        if vol_ratio > 0.8:
+        if compress_ratio > max_cr:
             return None
 
-        # 不允许连续两天 ATR 扩大（突破收敛）
+        bg_vol = cls._avg(volumes[vbw[0]:vbw[1]])
+        recent_vol_avg = cls._avg(volumes[-rtw:])
+        vol_ratio = recent_vol_avg / bg_vol if bg_vol > 0 else 1
+        if vol_ratio > max_vr:
+            return None
+
         violations = sum(1 for j in range(1, len(recent_tr)) if recent_tr[j] > recent_tr[j-1])
-        if violations > 2:
+        if violations > max_viol:
             return None
 
-        score = 50
+        cr_cfg = scoring.get("compress_ratio", [])
+        vr_cfg = scoring.get("volume_ratio", [])
+        ma50_prox = scoring.get("ma50_proximity", {})
+        score = thr.get("base_score", 50)
         parts = []
 
-        if compress_ratio <= 0.4: score += 20; parts.append(f"极度压缩({compress_ratio:.0%})")
-        elif compress_ratio <= 0.6: score += 15; parts.append(f"明显压缩({compress_ratio:.0%})")
-        else: score += 8; parts.append(f"轻度压缩({compress_ratio:.0%})")
+        for c in cr_cfg:
+            if compress_ratio <= c[0]: score += c[1]; parts.append(c[2].format(ratio=compress_ratio)); break
+        for v in vr_cfg:
+            if vol_ratio <= v[0]: score += v[1]; parts.append(v[2]); break
+        if not parts: parts.append("微缩")
 
-        if vol_ratio <= 0.4: score += 15; parts.append("地量")
-        elif vol_ratio <= 0.6: score += 10; parts.append("缩量")
-        else: parts.append("微缩")
-
-        # 价格在均线附近（蓄势待发）
-        cur = float(closes[-1])
-        if len(closes) >= 50:
+        if ma50_prox.get("enabled") and len(closes) >= 50:
             ma50 = float(np.mean(closes[-50:]))
-            if ma50 > 0 and abs(cur - ma50) / ma50 < 0.03:
-                score += 15; parts.append("均线附近")
+            max_dist = ma50_prox.get("max_distance_pct", 3.0) / 100
+            if ma50 > 0 and abs(float(closes[-1]) - ma50) / ma50 < max_dist:
+                score += ma50_prox.get("score", 15); parts.append("均线附近")
 
-        return ("Compression", score, " | ".join(parts)) if score >= 60 else None
+        return ("Compression", score, " | ".join(parts)) if score >= thr.get("min_score", 60) else None
 
 
     # -------------------------------------------------------
@@ -512,67 +539,59 @@ class WyckoffAnalyzer:
     # -------------------------------------------------------
     @classmethod
     def detect_markup(cls, closes, highs, lows, volumes, trend):
-        """
-        Markup 主升段：MA50 上穿 MA200 且保持在上方 N 日
-        确认进入上升趋势主升段
-        """
-        if trend != "多头":
+        """Markup 主升段：MA50 上穿 MA200 且保持在上方 N 日"""
+        cfg = cls._cfg("markup")
+        if not cfg.get("enabled", True) or trend in cfg.get("exclude_trends", ["空头"]):
             return None
-        if len(closes) < 210:
+        if len(closes) < cfg.get("min_bars", 210):
             return None
-
-        ma50 = np.array([np.mean(closes[i-50:i]) for i in range(50, len(closes))])
-        ma200 = np.array([np.mean(closes[i-200:i]) for i in range(200, len(closes))])
-        if len(ma50) < 5:
+        if len(closes) < 200:
             return None
 
-        score = 0
-        parts = []
-
-        # 检查 MA50 是否 > MA200（趋势成立）
-        if ma50[-1] <= ma200[-1]:
+        ma50_arr = np.array([np.mean(closes[i-50:i]) for i in range(50, len(closes))])
+        ma200_arr = np.array([np.mean(closes[i-200:i]) for i in range(200, len(closes))])
+        if len(ma50_arr) < cfg.get("min_ma_bars", 5):
+            return None
+        if ma50_arr[-1] <= ma200_arr[-1]:
             return None
 
-        score += 20; parts.append("MA50>MA200")
+        scoring = cfg.get("scoring", {})
+        thr = cfg.get("thresholds", {})
+        score = scoring.get("base_score", 20)
+        parts = ["MA50>MA200"]
 
-        # 过去 20 日内是否存在 MA50 上穿 MA200
+        cross_win = cfg.get("crossover_window", 20)
+        cd_cfg = scoring.get("crossover_days", [])
         crossover_detected = False
-        for j in range(min(20, len(ma50)-1), 0, -1):
-            if ma50[-j-1] <= ma200[-j-1] and ma50[-j] > ma200[-j]:
+        for j in range(min(cross_win, len(ma50_arr)-1), 0, -1):
+            if ma50_arr[-j-1] <= ma200_arr[-j-1] and ma50_arr[-j] > ma200_arr[-j]:
                 crossover_detected = True
                 days_since = j
                 parts.append(f"上穿{days_since}天前")
+                for cd in cd_cfg:
+                    if days_since <= cd[0]: score += cd[1]; parts.append(cd[2]); break
                 break
-
         if not crossover_detected:
-            # 已经穿越很久了，但确认趋势持续
-            if ma50[-1] > ma200[-1] * 1.05:
-                score += 15; parts.append("趋势持续")
-        else:
-            if days_since <= 5: score += 25; parts.append("金叉初现")
-            elif days_since <= 15: score += 18; parts.append("金叉确认")
-            else: score += 10; parts.append("趋势稳固")
+            ts = scoring.get("trend_sustained", {})
+            if ma50_arr[-1] > ma200_arr[-1] * (1 + ts.get("ma_gap_pct", 5) / 100):
+                score += ts.get("score", 15); parts.append("趋势持续")
 
-        # MA50 角度（趋势强度）
+        angle_cfg = scoring.get("ma50_angle", [])
         ma50_vals = [np.mean(closes[i-50:i]) for i in range(-10, 0)]
         if len(ma50_vals) >= 2:
             angle = (ma50_vals[-1] - ma50_vals[0]) / ma50_vals[0] * 100
-            if angle >= 5: score += 20; parts.append("陡峭上升")
-            elif angle >= 2: score += 12; parts.append("平稳上升")
-            else: score += 5; parts.append("走平")
+            for a in angle_cfg:
+                if angle >= a[0]: score += a[1]; parts.append(a[2]); break
 
-        # 价格在 MA50 上方
-        cur = float(closes[-1])
-        if cur > ma50[-1]:
-            score += 15; parts.append("价格在MA50上")
+        if float(closes[-1]) > ma50_arr[-1]:
+            score += scoring.get("above_ma50", 15); parts.append("价格在MA50上")
 
-        # 量能配合
         bg_vol = cls._avg(volumes[-50:-10])
         recent_vol = cls._avg(volumes[-10:])
-        if bg_vol > 0 and recent_vol > bg_vol * 1.2:
-            score += 10; parts.append("量能配合")
+        if bg_vol > 0 and recent_vol > bg_vol * scoring.get("volume_ratio", 1.2):
+            score += scoring.get("volume_score", 10); parts.append("量能配合")
 
-        return ("Markup", score, " | ".join(parts)) if score >= 50 else None
+        return ("Markup", score, " | ".join(parts)) if score >= thr.get("min_score", 50) else None
 
 
     # -------------------------------------------------------
@@ -580,73 +599,74 @@ class WyckoffAnalyzer:
     # -------------------------------------------------------
     @classmethod
     def detect_accum_stage(cls, closes, highs, lows, volumes, trend):
-        """
-        吸筹期子阶段细分：
-        - Accum_A: 下跌停止，量能萎缩，低位盘整
-        - Accum_B: 底部区间反复测试，低点逐步抬高
-        - Accum_C: 最后缩量回踩不破A低
-        """
-        if trend in ("空头", "错误"):
+        """吸筹期子阶段细分：A 止跌 / B 探底 / C 回踩"""
+        cfg = cls._cfg("accumulation")
+        if not cfg.get("enabled", True) or trend in cfg.get("exclude_trends", ["空头", "错误"]):
             return None
-        if len(closes) < 60:
+        if len(closes) < cfg.get("min_bars", 60):
             return None
 
         cur = float(closes[-1])
         low_60d = float(min(lows[-60:]))
-
-        # 条件：价格必须在年内低位附近（年内低点 +35% 以内）
         low_250d = float(min(lows[-250:])) if len(lows) >= 250 else low_60d
-        if low_250d > 0 and cur > low_250d * 1.35:
+        max_price_pct = cfg.get("max_price_from_low_pct", 35)
+        if low_250d > 0 and cur > low_250d * (1 + max_price_pct / 100):
             return None
 
         accum_base_low = low_250d
-
-        # 均线胶着：MA50 和 MA200 差距小
+        max_ma_gap = cfg.get("max_ma_gap_pct", 8)
         ma50 = float(np.mean(closes[-50:])) if len(closes) >= 50 else 0
         ma200 = float(np.mean(closes)) if len(closes) >= 200 else 0
         if ma200 > 0:
             ma_gap = abs(ma50 - ma200) / ma200 * 100
-            if ma_gap > 8:
-                return None  # 均线分离太远，不在吸筹期
+            if ma_gap > max_ma_gap:
+                return None
 
-        # 量能萎缩确认
-        vol_recent = cls._avg(volumes[-20:])
-        vol_hist = cls._avg(volumes[-120:-20])
-        if vol_hist > 0 and vol_recent / vol_hist > 0.7:
-            return None  # 量能还没干枯
+        vol_r = cfg.get("vol_window", [20, 120])
+        vol_recent = cls._avg(volumes[-vol_r[0]:])
+        vol_hist = cls._avg(volumes[-vol_r[1]:-vol_r[0]])
+        if vol_hist > 0 and vol_recent / vol_hist > cfg.get("max_vol_ratio", 0.7):
+            return None
 
-        score = 40
+        scoring = cfg.get("scoring", {})
+        score = scoring.get("base_score", 40)
         parts = []
 
-        # ---- 判定 ABC ----
-        # B 阶段特征：最近 30 日内多次测试底部
-        zone_lows = lows[-30:]
-        test_count = sum(1 for l in zone_lows if abs(l - accum_base_low) / accum_base_low <= 0.05)
+        b_cfg = scoring.get("b_stage", {})
+        tw = b_cfg.get("test_window", 30)
+        tt = b_cfg.get("test_threshold_pct", 5) / 100
+        tc = b_cfg.get("test_count_threshold", 3)
+        zone_lows = lows[-tw:]
+        test_count = sum(1 for l in zone_lows if accum_base_low > 0 and abs(l - accum_base_low) / accum_base_low <= tt)
 
-        if test_count >= 3:
-            stage = "Accum_B"
-            score += 30; parts.append(f"多次探底({test_count}次)")
+        if test_count >= tc:
+            stage = b_cfg.get("label", "Accum_B")
+            score += b_cfg.get("score", 30)
+            parts.append(b_cfg.get("desc", "多次探底({count}次)").format(count=test_count))
         else:
-            # C 阶段特征：最近小幅下跌但不破底，量能再度萎缩
-            recent_low = float(min(lows[-20:]))
-            c_ok = accum_base_low > 0 and recent_low >= accum_base_low * 0.97
+            c_cfg = scoring.get("c_stage", {})
+            recent_low = float(min(lows[-c_cfg.get("window", 20):]))
+            c_ok = accum_base_low > 0 and recent_low >= accum_base_low * c_cfg.get("min_from_base_pct", 97) / 100
             if c_ok:
-                vol_dry = cls._avg(volumes[-10:])
-                vol_hist_c = cls._avg(volumes[-60:-20])
-                if vol_hist_c > 0 and vol_dry / vol_hist_c < 0.6:
-                    stage = "Accum_C"
-                    score += 25; parts.append("缩量回踩不破底")
+                vw = c_cfg.get("vol_window", [60, 20])
+                vol_dry = cls._avg(volumes[-vw[1]:])
+                vol_hist_c = cls._avg(volumes[-vw[0]:-vw[1]])
+                if vol_hist_c > 0 and vol_dry / vol_hist_c < c_cfg.get("max_vol_ratio", 0.6):
+                    stage = c_cfg.get("label", "Accum_C")
+                    score += c_cfg.get("score", 25); parts.append(c_cfg.get("desc", "缩量回踩不破底"))
                 else:
-                    stage = "Accum_A"
-                    score += 15; parts.append("止跌缩量")
+                    a_cfg = scoring.get("a_stage", {})
+                    stage = a_cfg.get("label", "Accum_A")
+                    score += a_cfg.get("score", 15); parts.append(a_cfg.get("desc", "止跌缩量"))
             else:
-                stage = "Accum_A"
-                score += 15; parts.append("止跌缩量")
+                a_cfg = scoring.get("a_stage", {})
+                stage = a_cfg.get("label", "Accum_A")
+                score += a_cfg.get("score", 15); parts.append(a_cfg.get("desc", "止跌缩量"))
 
-        if ma_gap < 4:
-            score += 10; parts.append("均线粘合")
-        if vol_recent / vol_hist < 0.4:
-            score += 10; parts.append("地量")
+        if ma200 > 0 and ma_gap < cfg.get("tight_ma_gap_pct", 4):
+            score += scoring.get("ma_tight_score", 10); parts.append("均线粘合")
+        if vol_hist > 0 and vol_recent / vol_hist < cfg.get("dry_vol_ratio", 0.4):
+            score += scoring.get("dry_vol_score", 10); parts.append("地量")
 
         return (stage, score, " | ".join(parts))
 
@@ -661,101 +681,97 @@ class WyckoffAnalyzer:
         利用 Accum ABC / Markup 做更细粒度判断。
         return: (phase_label, description, confidence)
         """
+        cf = cls._cfg("phase")
+        min_bars = cf.get("min_bars", 50)
         if extra is None:
             extra = {}
-        if len(closes) < 50:
+        if len(closes) < min_bars:
             return ("数据不足", "", 0)
 
         cur = float(closes[-1])
         ma50 = float(np.mean(closes[-50:]))
         ma200 = float(np.mean(closes)) if len(closes) >= 200 else 0
+        rw = cf.get("range_window", 60)
+        bt = cf.get("breakout_threshold", 1.0) / 100
 
-        # 近期震荡区间（过去60天）
-        range_high = float(max(highs[-60:]))
-        range_low  = float(min(lows[-60:]))
-        range_size = (range_high - range_low) / range_low * 100 if range_low > 0 else 0
-
-        above_range = cur > range_high * 1.01
-        below_range = cur < range_low * 0.99
+        range_high = float(max(highs[-rw:]))
+        range_low = float(min(lows[-rw:]))
+        above_range = cur > range_high * (1 + bt)
+        below_range = cur < range_low * (1 - bt)
         in_range = not above_range and not below_range
 
-        # 成交量趋势
+        vs = cf.get("vol_state", {})
         avg_vol_50 = float(np.mean(volumes[-50:])) if len(volumes) >= 50 else 1
         avg_vol_10 = float(np.mean(volumes[-10:])) if len(volumes) >= 10 else 1
-        if avg_vol_10 < avg_vol_50 * 0.7:
+        if avg_vol_10 < avg_vol_50 * vs.get("shrink_ratio", 0.7):
             vol_state = "缩量"
-        elif avg_vol_10 > avg_vol_50 * 1.3:
+        elif avg_vol_10 > avg_vol_50 * vs.get("expand_ratio", 1.3):
             vol_state = "放量"
         else:
             vol_state = "量平"
 
-        # 提取事件类型
         et = set(e[0] for e in events if e[1] > 0)
-        has_spring   = any("Spring" in e for e in et)
         has_sos      = "SOS" in et
         has_lps      = "LPS" in et
+        has_spring   = any("Spring" in e for e in et)
         has_upthrust = "Upthrust" in et
         has_evr      = "EVR" in et
         has_compression = "Compression" in et
         extra_accum = extra.get("accum_stage")
         extra_markup = extra.get("markup")
+        conf = cf.get("confidence", {})
+        pb = cf.get("phase_b", {})
+        range_size = (range_high - range_low) / range_low * 100 if range_low > 0 else 0
 
-        # ----- 根据趋势 + 事件 + 位置 判断阶段 -----
         if trend == "多头":
-            # Markup 优先：主升段
             if extra_markup:
-                return ("Phase D→E — Markup主升段",
-                        f"MA50上穿MA200确认，趋势强度{extra_markup[1]}，{vol_state}，多头主导", 88)
-
+                return (f"Phase D→E — Markup主升段",
+                        f"MA50上穿MA200确认，趋势强度{extra_markup[1]}，{vol_state}，多头主导",
+                        conf.get("markup", 88))
             if has_sos:
-                if above_range:
-                    return ("Phase D→E — 突破确认/上升趋势",
-                            f"价格突破区间{range_low:.1f}-{range_high:.1f}，SOS信号确认，多头主导", 88)
-                return ("Phase D — SOS强势信号确认",
-                        f"SOS出现，价格在区间{range_low:.1f}-{range_high:.1f}内整理，{vol_state}，等待突破", 82)
+                label = "Phase D→E — 突破确认/上升趋势" if above_range else "Phase D — SOS强势信号确认"
+                detail = (f"价格突破区间{range_low:.1f}-{range_high:.1f}，SOS信号确认，多头主导"
+                          if above_range else
+                          f"SOS出现，价格在区间{range_low:.1f}-{range_high:.1f}内整理，{vol_state}，等待突破")
+                return (label, detail, conf.get("sos_breakout" if above_range else "sos_in_range", 85))
             if above_range:
                 return ("Phase E — 上升趋势中",
-                        f"均线多头排列({ma50/ma200-1:+.1%})，沿趋势运行", 82)
+                        f"均线多头排列({ma50/ma200-1:+.1%})，沿趋势运行" if ma200 > 0 else "多头趋势运行",
+                        conf.get("trend_up", 82))
             if in_range and has_lps:
-                return ("Phase D — LPS最后支撑点",
-                        f"缩量回调至支撑附近，最佳入场区域", 85)
+                return ("Phase D — LPS最后支撑点", "缩量回调至支撑附近，最佳入场区域", conf.get("lps", 85))
             if in_range and has_spring:
-                return ("Phase C — Spring弹簧确认",
-                        f"支撑位附近探底回升，底部确认", 85)
+                return ("Phase C — Spring弹簧确认", "支撑位附近探底回升，底部确认", conf.get("spring", 85))
             if in_range and has_compression:
                 return ("Phase B→C — 压缩蓄势",
-                        f"波动率收窄+缩量，变盘前夜，{vol_state}", 80)
-
-            # 利用 Accum ABC 子阶段
+                        f"波动率收窄+缩量，变盘前夜，{vol_state}", conf.get("compression", 80))
             if in_range and extra_accum:
-                stage_name = {"Accum_A": "A(止跌缩量)", "Accum_B": "B(探底测试)", "Accum_C": "C(最后回踩)"}
-                sub = stage_name.get(extra_accum[0], extra_accum[0])
-                return (f"Phase A→B — 吸筹{sub}",
-                        f"价格在{range_low:.1f}-{range_high:.1f}整理，{vol_state}，{extra_accum[2]}", 72)
-
+                sn = {"Accum_A": "A(止跌缩量)", "Accum_B": "B(探底测试)", "Accum_C": "C(最后回踩)"}
+                return (f"Phase A→B — 吸筹{sn.get(extra_accum[0], extra_accum[0])}",
+                        f"价格在{range_low:.1f}-{range_high:.1f}整理，{vol_state}，{extra_accum[2]}",
+                        conf.get("accum", 72))
             if in_range:
-                if range_size < 20:
+                if range_size < pb.get("max_range_size_pct", 20):
                     return ("Phase B — 吸筹区间震荡",
-                            f"价格在{range_low:.1f}-{range_high:.1f}整理，{vol_state}，蓄力待发", 72)
+                            f"价格在{range_low:.1f}-{range_high:.1f}整理，{vol_state}，蓄力待发",
+                            conf.get("phase_b", 72))
                 return ("Phase A→B — 吸筹筑底期",
-                        f"均线走平，{vol_state}，关注区间方向选择", 65)
+                        f"均线走平，{vol_state}，关注区间方向选择", conf.get("phase_b_build", 65))
 
         elif trend == "空头":
             if below_range:
-                return ("Phase E — 下降趋势中",
-                        "空头主导，不宜做多，等待底部结构形成", 80)
+                return ("Phase E — 下降趋势中", "空头主导，不宜做多，等待底部结构形成", conf.get("downtrend", 80))
             if in_range and has_upthrust:
                 return ("Phase C — Upthrust上冲回落",
-                        "突破阻力后收回，派发特征，警惕进一步下跌", 85)
+                        "突破阻力后收回，派发特征，警惕进一步下跌", conf.get("upthrust_in_range", 85))
             if in_range:
                 return ("Phase B — 派发区间震荡",
-                        f"价格反弹受阻，{vol_state}，注意二次探底风险", 68)
+                        f"价格反弹受阻，{vol_state}，注意二次探底风险", conf.get("distribute", 68))
             return ("Phase A — 派发初期",
-                    "高位滞涨，供应开始出现，注意趋势转变", 60)
+                    "高位滞涨，供应开始出现，注意趋势转变", conf.get("distribute_early", 60))
 
-        # 盘整
         return ("Phase B — 区间整理",
-                f"均线交织，价格在{range_low:.1f}-{range_high:.1f}区间波动", 55)
+                f"均线交织，价格在{range_low:.1f}-{range_high:.1f}区间波动", conf.get("range_trade", 55))
 
 
 # ============================================================
@@ -764,10 +780,15 @@ class WyckoffAnalyzer:
 
 class Scanner:
 
-    SINA_HQ_URL = "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
-    TENCENT_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,350,qfq"
+    _sc = get_scanner_config()
 
-    INDUSTRY_CACHE = os.path.join(os.path.dirname(__file__), "industry_cache.json")
+    SINA_HQ_URL = _sc.get("api", {}).get("sina_hq",
+        "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData")
+    TENCENT_KLINE_URL = _sc.get("api", {}).get("tencent_kline",
+        "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,350,qfq")
+
+    INDUSTRY_CACHE = os.path.join(os.path.dirname(__file__),
+        _sc.get("industry", {}).get("cache_file", "industry_cache.json"))
 
     def __init__(self):
         self.all_stocks = []
@@ -775,16 +796,30 @@ class Scanner:
         self.industry_map = {}
         self.candidates = []
         self.results = []
+        self._sc = get_scanner_config()
 
     # ==================== 行业分类 ====================
 
-    def build_industry_map(self, force=False):
+    def build_industry_map(self, force=False, use_akshare=True):
         if not force and os.path.exists(self.INDUSTRY_CACHE):
             try:
                 with open(self.INDUSTRY_CACHE, encoding="utf-8") as f:
                     self.industry_map = json.load(f)
-                return
+                if self.industry_map:
+                    return
             except Exception: pass
+
+        if use_akshare:
+            try:
+                print("  (AKShare 行业分类)...", end=" ")
+                t0 = time.time()
+                self.industry_map = AkshareProvider.get_industry_map()
+                if self.industry_map:
+                    print(f"{len(self.industry_map)} 只 ({time.time()-t0:.1f}s)")
+                    self._save_industry_cache()
+                    return
+            except Exception as e:
+                print(f"AKShare失败({e}), 回退baostock...")
 
         import baostock as bs
         bs.login()
@@ -797,6 +832,9 @@ class Scanner:
         finally:
             bs.logout()
 
+        self._save_industry_cache()
+
+    def _save_industry_cache(self):
         try:
             with open(self.INDUSTRY_CACHE, "w", encoding="utf-8") as f:
                 json.dump(self.industry_map, f, ensure_ascii=False)
@@ -808,16 +846,21 @@ class Scanner:
     # ==================== 获取全市场数据 ====================
 
     @staticmethod
-    def _fetch_page(page, num=100):
+    def _fetch_page(page, num=100, timeout=20):
         params = {"page": page, "num": num, "sort": "symbol",
                   "asc": "1", "node": "hs_a", "_s_r_a": "init"}
-        r = requests.get(Scanner.SINA_HQ_URL, params=params, timeout=20)
+        r = requests.get(Scanner.SINA_HQ_URL, params=params, timeout=timeout)
         return r.json()
 
-    def fetch_all_stocks(self, max_pages=80):
+    def fetch_all_stocks(self, max_pages=None):
+        fc = self._sc.get("fetch", {})
+        max_pages = max_pages or fc.get("max_pages", 80)
+        page_size = fc.get("page_size", 100)
+        workers = fc.get("thread_pool", 15)
+        timeout = fc.get("request_timeout", 20)
         all_data = []
-        with ThreadPoolExecutor(max_workers=15) as pool:
-            futures = {pool.submit(self._fetch_page, p): p for p in range(1, max_pages + 1)}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(self._fetch_page, p, page_size, timeout): p for p in range(1, max_pages + 1)}
             for f in as_completed(futures):
                 try:
                     data = f.result()
@@ -826,37 +869,59 @@ class Scanner:
                 except Exception: pass
 
         stocks, snapshot = [], {}
-        for item in all_data:
-            code = item.get("code", "")
-            name = item.get("name", "")
-            symbol = item.get("symbol", "")
+        if all_data:
+            for item in all_data:
+                code = item.get("code", "")
+                name = item.get("name", "")
+                symbol = item.get("symbol", "")
 
-            if symbol.startswith("bj") or code.startswith("9"):
-                continue
+                if symbol.startswith("bj") or code.startswith("9"):
+                    continue
 
-            bs_code = f"{symbol[:2]}.{symbol[2:]}" if len(symbol) >= 4 else f"sz.{code}"
+                bs_code = f"{symbol[:2]}.{symbol[2:]}" if len(symbol) >= 4 else f"sz.{code}"
+                try:
+                    price = float(item.get("trade", 0))
+                    amount = float(item.get("amount", 0))
+                    volume = float(item.get("volume", 0))
+                    turnover = float(item.get("turnoverratio", 0))
+                    high = float(item.get("high", 0))
+                    low = float(item.get("low", 0))
+                    change_pct = float(item.get("changepercent", 0))
+                except (ValueError, TypeError):
+                    continue
+
+                if price <= 0 or amount <= 0:
+                    continue
+
+                stocks.append({"code": bs_code, "name": name})
+                snapshot[bs_code] = {
+                    "code": bs_code, "name": name, "price": price,
+                    "amount": amount, "volume": volume, "turnover": turnover,
+                    "high": high, "low": low, "open": float(item.get("open", price)),
+                    "pre_close": float(item.get("yestodayclose", price / (1 + change_pct/100) if abs(change_pct) > 0 else price)),
+                    "change_pct": change_pct,
+                }
+
+        # ── 兜底：Sina API 限流时用 AKShare 股票代码列表 ──
+        if not snapshot:
             try:
-                price = float(item.get("trade", 0))
-                amount = float(item.get("amount", 0))
-                volume = float(item.get("volume", 0))
-                turnover = float(item.get("turnoverratio", 0))
-                high = float(item.get("high", 0))
-                low = float(item.get("low", 0))
-                change_pct = float(item.get("changepercent", 0))
-            except (ValueError, TypeError):
-                continue
-
-            if price <= 0 or amount <= 0:
-                continue
-
-            stocks.append({"code": bs_code, "name": name})
-            snapshot[bs_code] = {
-                "code": bs_code, "name": name, "price": price,
-                "amount": amount, "volume": volume, "turnover": turnover,
-                "high": high, "low": low, "open": float(item.get("open", price)),
-                "pre_close": float(item.get("yestodayclose", price / (1 + change_pct/100) if abs(change_pct) > 0 else price)),
-                "change_pct": change_pct,
-            }
+                import akshare as ak
+                df = ak.stock_info_a_code_name()
+                for _, row in df.iterrows():
+                    code = str(row["code"])
+                    name = str(row["name"])
+                    if code.startswith("9"):
+                        continue
+                    market = "sh" if code.startswith("6") else "sz"
+                    bs_code = f"{market}.{code}"
+                    stocks.append({"code": bs_code, "name": name})
+                    snapshot[bs_code] = {
+                        "code": bs_code, "name": name, "price": 0,
+                        "amount": 0, "volume": 0, "turnover": 0,
+                        "high": 0, "low": 0, "open": 0, "pre_close": 0, "change_pct": 0,
+                    }
+            except Exception:
+                pass
 
         self.all_stocks = stocks
         self.snapshot = snapshot
@@ -864,9 +929,16 @@ class Scanner:
 
     # ==================== 过滤 ====================
 
-    def filter_candidates(self, min_amount=5e8):
-        candidates = [d for d in self.snapshot.values() if d["amount"] >= min_amount]
-        candidates.sort(key=lambda x: x["amount"], reverse=True)
+    def filter_candidates(self, min_amount=None):
+        min_amount = min_amount if min_amount is not None else self._sc.get("filter", {}).get("min_amount", 500000000)
+        # 有实时数据时按成交额过滤
+        has_realtime = any(v["amount"] > 0 for v in self.snapshot.values())
+        if has_realtime:
+            candidates = [d for d in self.snapshot.values() if d["amount"] >= min_amount]
+            candidates.sort(key=lambda x: x["amount"], reverse=True)
+        else:
+            # 兜底：无实时数据时全量返回（限流模式）
+            candidates = list(self.snapshot.values())
         self.candidates = candidates
         return candidates
 
@@ -937,16 +1009,44 @@ class Scanner:
 
         return result
 
-    def run_analysis(self, max_stocks=80):
+    def enrich_with_financials(self, stocks_with_sigs, max_items=None):
+        """对威科夫信号股票补充基本面数据（PE/PB/ROE/市值）"""
+        analysis_cfg = self._sc.get("analysis", {})
+        max_items = max_items or analysis_cfg.get("financial_batch_size", 10)
+        fin_interval = analysis_cfg.get("financial_interval", 0.3)
+        enriched = []
+        for s in stocks_with_sigs[:max_items]:
+            try:
+                code = s["code"].split(".")[1] if "." in s["code"] else s["code"]
+                fin = AkshareProvider.get_financial_indicators(code)
+                s["pe"] = fin.get("pe")
+                s["pb"] = fin.get("pb")
+                s["roe"] = fin.get("roe")
+                s["total_mv"] = fin.get("total_mv")
+            except Exception:
+                s["pe"] = s["pb"] = s["roe"] = s["total_mv"] = None
+            enriched.append(s)
+            time.sleep(fin_interval)
+        return enriched
+
+    def run_analysis(self, max_stocks=None):
+        analysis_cfg = self._sc.get("analysis", {})
+        max_stocks = max_stocks or analysis_cfg.get("max_stocks", 80)
+        stock_interval = analysis_cfg.get("stock_interval", 0.02)
         results = []
         total = min(len(self.candidates), max_stocks)
 
         for i, stock in enumerate(self.candidates[:max_stocks]):
             analysis = self._analyze_stock(stock["code"])
             results.append({**stock, **analysis})
-            if (i + 1) % 10 == 0:
-                print(f"  {i+1}/{total}")
-            time.sleep(0.02)
+            if (i + 1) % 10 == 0 and total > 10:
+                sys.stdout.write(f"\r  ⏳ 分析进度: {i+1}/{total}")
+                sys.stdout.flush()
+            time.sleep(stock_interval)
+
+        if total > 10:
+            sys.stdout.write(f"\r  ⏳ 分析进度: {total}/{total}\n")
+            sys.stdout.flush()
 
         # 排序：威科夫信号得分 > 多头 > 成交额
         def sort_key(x):
@@ -959,6 +1059,16 @@ class Scanner:
         return results
 
     # ==================== 报告 ====================
+
+    def _get_concept_board_performance(self):
+        """获取概念板块当日涨幅Top10（用于市场情绪参考）"""
+        try:
+            boards = AkshareProvider.get_concept_boards()
+            if boards:
+                return [(b.get("板块名称", ""), b.get("涨跌幅", 0)) for b in boards[:10]]
+        except Exception:
+            pass
+        return []
 
     def print_report(self, top_n=15):
         bullish = sum(1 for r in self.results if r["trend"] == "多头")
@@ -1028,23 +1138,48 @@ class Scanner:
         # === 信号精选 ===
         valid = [r for r in self.results if r["wyckoff_sig"] not in ("-", "无信号", "数据不足", "无数据")]
         if valid:
+            # 补充基本面数据
+            enriched = self.enrich_with_financials(valid, 10)
             print(f"  【威科夫信号精选 Top {min(10, len(valid))}】")
-            print(f"  {'信号':<14} {'代码':<8} {'名称':<7} {'板块':<12} {'得分':<5} {'细节':<32}")
+            print(f"  {'信号':<14} {'代码':<8} {'名称':<7} {'板块':<12} {'得分':<5} {'PE':<7} {'ROE':<6} {'细节':<24}")
             print(f"  " + "-" * 88)
-            for r in valid[:10]:
+            for r in enriched[:10]:
                 sym = r["code"].split(".")[1]
                 name = r["name"][:6]
                 ind = r.get("industry", "其他")[:10]
                 sig = r["wyckoff_sig"]
                 sc = r["wyckoff_score"]
-                detail = r.get("wyckoff_detail", "")[:30]
-                print(f"  {sig:<14} {sym:<8} {name:<7} {ind:<12} {sc:<5} {detail:<32}")
+                pe = f"{r['pe']:.1f}" if r.get("pe") else "-"
+                roe = f"{r['roe']:.1f}%" if r.get("roe") else "-"
+                detail = r.get("wyckoff_detail", "")[:24]
+                print(f"  {sig:<14} {sym:<8} {name:<7} {ind:<12} {sc:<5} {pe:<7} {roe:<6} {detail:<24}")
             print()
+
+        # === 概念板块热度 ===
+        try:
+            concepts = self._get_concept_board_performance()
+            if concepts:
+                print(f"  【概念板块涨幅 Top10】")
+                print(f"  {'板块':<20} {'涨跌幅':<8}")
+                print(f"  " + "-" * 30)
+                for name, pct in concepts:
+                    arr = "↑" if pct > 0 else "↓"
+                    print(f"  {name:<20} {arr} {abs(pct):+.2f}%")
+                print()
+        except Exception:
+            pass
 
     # ==================== 主流程 ====================
 
-    def run(self, min_amount=5e8, max_analysis=80, top_n=15, quick=False):
-        print("A股扫描器 v2.1（威科夫形态检测）")
+    def run(self, min_amount=None, max_analysis=None, top_n=None, quick=False):
+        ac = self._sc.get("analysis", {})
+        rc = self._sc.get("report", {})
+        fc = self._sc.get("filter", {})
+        min_amount = min_amount or fc.get("min_amount", 500000000)
+        max_analysis = max_analysis or ac.get("max_stocks", 80)
+        top_n = top_n or rc.get("top_n_default", 15)
+
+        print("A股扫描器 v2.2（威科夫形态检测，YAML配置）")
         print("=" * 62)
         print(f"成交额门槛: {min_amount/1e8:.0f}亿\n")
 

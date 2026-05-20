@@ -1,0 +1,380 @@
+# 威科夫形态检测参数
+# 修改此文件无需改动代码，重启扫描即可生效
+# 参数说明：所有窗口以K线根数为单位，得分为累计制
+
+# ============================================================
+# Spring 弹簧
+# ============================================================
+spring:
+  enabled: true
+  # 排除趋势
+  exclude_trends: ["空头", "错误"]
+
+  # 支撑计算窗口（取最低价）
+  support_window: [-12, -3]
+  # 价格在支撑附近的判定范围（倍率）
+  price_range: [0.95, 1.15]
+
+  # 基准量窗口
+  volume_baseline_window: [-15, -3]
+  # 检测窗口（最近N根K线中逐根检测）
+  detect_window: [-3, null]
+
+  scoring:
+    # 探底深度（百分比）
+    depth:
+      - [4.0, 25, "深探{depth:.1f}%"]
+      - [2.0, 20, "中探{depth:.1f}%"]
+      - [0.0, 12, "浅探{depth:.1f}%"]
+    # 量比
+    volume_ratio:
+      - [2.5, 25, "巨量"]
+      - [1.8, 20, "放量"]
+      - [1.2, 12, "微放量"]
+      - [0.0, 5,  "量平"]
+    # 反弹幅度（百分比）
+    bounce:
+      - [5.0, 25, "强弹{bounce:.1f}%"]
+      - [3.0, 18, "中弹{bounce:.1f}%"]
+      - [1.5, 10, "弱弹{bounce:.1f}%"]
+    # 次日确认
+    next_day_confirm: 15
+
+  thresholds:
+    strong_signal: 55  # 以上为Spring
+    weak_label: "弱Spring"
+
+# ============================================================
+# SOS 强势信号
+# ============================================================
+sos:
+  enabled: true
+  exclude_trends: ["空头"]  # 只有多头趋势出SOS
+  min_bars: 50
+
+  # 位阶保护：SOS不应出现在远离MA200的高位
+  ma200_bias_protection:
+    enabled: true
+    max_bias_pct: 25  # 超过此百分比视为高位派发，不判定SOS
+
+  volume_baseline_window: [-20, -1]
+  range_baseline_window: [-20, -1]
+
+  scoring:
+    # 涨幅
+    price_pct:
+      - [5.0, 25, "大涨{pct:.1f}%"]
+      - [3.0, 20, "中涨{pct:.1f}%"]
+      - [1.5, 12, "小涨{pct:.1f}%"]
+    # 量比
+    volume_ratio:
+      - [2.0, 25, "放量"]
+      - [1.5, 18, "增量"]
+      - [1.2, 10, "微增"]
+      - [0.0, 5,  "量平"]
+    # 收盘在K线中的位置（0~1）
+    close_position:
+      - [0.8, 25, "收高位"]
+      - [0.6, 15, "收中上"]
+      - [0.0, 5,  "收中位"]
+    # 振幅比
+    range_ratio:
+      - [1.5, 15, "宽幅"]
+      - [1.0, 8,  "正常幅"]
+    # 价格在MA50上方
+    above_ma50: 10
+
+  thresholds:
+    min_score: 50  # 低于此分不输出信号
+
+# ============================================================
+# LPS 最后支撑点
+# ============================================================
+lps:
+  enabled: true
+  exclude_trends: ["空头"]
+  min_bars: 30
+
+  # 支撑计算窗口
+  support_window: [-12, -3]
+  # 价格在支撑附近的判定范围
+  price_range: [1.0, 1.05]  # support <= cur <= support * 1.05
+
+  # 前置放量上涨检测
+  surge_window: [-10, -3]
+  surge_baseline_window: [-25, -10]
+  surge_volume_ratio: 1.3  # 量比超过此值视为放量
+  surge_confirm_range: 5   # 检查最近N根天是否有放量上涨
+
+  scoring:
+    # 量比（当前量/基准量）
+    volume_ratio:
+      - [0.0, 30, "地量"]  # 用<阈值判定，需特殊处理
+      - [0.5, 30, "地量"]
+      - [0.7, 22, "缩量"]
+      - [0.9, 12, "微缩"]
+    # 对0的处理：代码中先判断vratio <= 0.5得30分，再判断<=0.7
+    # YAML中用列表顺序匹配
+    # 实体大小比例（当前实体/均实体）
+    body_ratio:
+      - [0.6, 15, "小实体"]
+      - [0.9, 8,  "中实体"]
+    # 支撑测试窗口（之前是否被Spring确认过）
+    support_tested_window: [-15, 0]
+    support_tested_score: 15
+    # 波幅收窄
+    range_narrowing:
+      window: [-10, -5, -5, 0]  # [older_start, older_end, recent_start, recent_end]
+      ratio_threshold: 0.7
+      score: 10
+
+  thresholds:
+    strong_signal: 60
+    min_score: 40
+    weak_label: "弱LPS"
+
+# ============================================================
+# Upthrust 上冲回落
+# ============================================================
+upthrust:
+  enabled: true
+  min_bars: 20
+
+  # 阻力计算窗口（取最高价）
+  resistance_window: [-12, -3]
+  # 价格在阻力附近的判定范围
+  price_range: [0.97, 1.03]
+
+  volume_baseline_window: [-15, -3]
+  detect_window: [-3, null]
+
+  scoring:
+    # 突破幅度（百分比）
+    thrust:
+      - [3.0, 20, "深探{thrust:.1f}%"]
+      - [1.5, 15, "中探{thrust:.1f}%"]
+      - [0.0, 8,  "浅探{thrust:.1f}%"]
+    # 量比
+    volume_ratio:
+      - [2.0, 25, "巨量"]
+      - [1.5, 18, "放量"]
+      - [1.2, 10, "微放量"]
+      - [0.0, 5,  "量平"]
+    # 收盘在K线中的位置（越低越好，上冲回落特征）
+    close_position:
+      - [0.3, 20, "收低位"]
+      - [0.5, 10, "收中低"]
+    # 上影线占比
+    upper_wick_ratio: 0.4
+    upper_wick_score: 15
+    # 次日确认
+    next_day_confirm: 10
+    # 基础分
+    base_score: 30
+
+  thresholds:
+    strong_signal: 55
+    weak_label: "弱Upthrust"
+
+# ============================================================
+# EVR 努力无结果
+# ============================================================
+evr:
+  enabled: true
+  exclude_trends: ["空头", "错误"]
+  min_bars: 30
+
+  # 位阶保护：远离MA200的高位放量滞涨按派发处理
+  ma200_bias_protection:
+    enabled: true
+    max_bias_pct: 30  # 超过此百分比视为高位派发
+
+  volume_baseline_window: [-20, -1]
+  detect_window: [-3, 0]  # 最近N天检测
+
+  # 判定条件
+  min_volume_ratio: 1.5   # 量比至少达到此值才算"努力"
+  max_price_change: 2.5   # 价格变化不超过此值才算"无结果"
+
+  scoring:
+    # 量比
+    volume_ratio:
+      - [2.5, 20, "巨量{vratio:.1f}倍"]
+      - [2.0, 15, "放量{vratio:.1f}倍"]
+      - [1.2, 8,  "增量{vratio:.1f}倍"]
+    # 窄幅
+    range_narrowing:
+      window: [-20, -1]
+      ratio_threshold: 0.7
+      score: 15
+    # 当日确认
+    confirm_threshold: 0.99  # 收盘不弱于前日的比例
+    confirm_score: 10
+    # 基础分
+    base_score: 50
+
+# ============================================================
+# Compression 压缩蓄势
+# ============================================================
+compression:
+  enabled: true
+  exclude_trends: ["错误"]
+  min_bars: 40
+  min_tr_bars: 25  # 真实波幅数据至少需要N根
+
+  # ATR窗口
+  recent_tr_window: 10
+  hist_tr_window: [30, 10]  # [start, end] from end
+
+  # 判定条件
+  max_compress_ratio: 0.75  # 波幅压缩比超过此值不算压缩
+  max_vol_ratio: 0.8        # 量比超过此值不算压缩
+  max_violations: 2          # 允许的最大ATR扩大天数
+
+  volume_baseline_window: [-30, -10]
+
+  scoring:
+    # 压缩程度
+    compress_ratio:
+      - [0.0, 20, "极度压缩({ratio:.0%})"]
+      - [0.4, 15, "明显压缩({ratio:.0%})"]
+      - [0.6, 8,  "轻度压缩({ratio:.0%})"]
+    # 量比
+    volume_ratio:
+      - [0.0, 15, "地量"]
+      - [0.4, 10, "缩量"]
+      - [0.6, 0,  "微缩"]
+    # 价格在MA50附近
+    ma50_proximity:
+      enabled: true
+      max_distance_pct: 3.0  # 价格距MA50不超过此百分比
+      score: 15
+
+  thresholds:
+    min_score: 60
+    base_score: 50
+
+# ============================================================
+# Markup 主升段确认（MA50上穿MA200）
+# ============================================================
+markup:
+  enabled: true
+  exclude_trends: ["空头"]
+  min_bars: 210
+  min_ma_bars: 5  # ma数组最小长度
+
+  # 交叉检测窗口（过去N天内是否有金叉）
+  crossover_window: 20
+
+  scoring:
+    # 基础：MA50 > MA200
+    base_score: 20
+    # 金叉天数
+    crossover_days:
+      - [5, 25, "金叉初现"]
+      - [15, 18, "金叉确认"]
+      - [999, 10, "趋势稳固"]
+    # 已经穿越很久，趋势持续
+    trend_sustained:
+      ma_gap_pct: 5
+      score: 15
+    # MA50角度
+    ma50_angle:
+      - [5.0, 20, "陡峭上升"]
+      - [2.0, 12, "平稳上升"]
+      - [0.0, 5,  "走平"]
+    # 价格在MA50上方
+    above_ma50: 15
+    # 量能配合
+    volume_ratio: 1.2
+    volume_score: 10
+
+  thresholds:
+    min_score: 50
+
+# ============================================================
+# Accumulation ABC 子阶段
+# ============================================================
+accumulation:
+  enabled: true
+  exclude_trends: ["空头", "错误"]
+  min_bars: 60
+
+  # 价格条件：必须在250日低点的一定范围内
+  max_price_from_low_pct: 35  # 超过低点此百分比不算吸筹
+
+  # 均线胶着判定
+  max_ma_gap_pct: 8  # MA50与MA200差距超过此值不算吸筹
+  tight_ma_gap_pct: 4  # 间距小于此值加"均线粘合"分
+
+  # 量能萎缩判定
+  vol_window: [20, 120]  # [recent, hist]
+  max_vol_ratio: 0.7     # 量比超过此值不算吸筹
+  dry_vol_ratio: 0.4     # 量比小于此值加"地量"分
+
+  scoring:
+    base_score: 40
+    # B阶段：多次探底
+    test_window: 30
+    test_threshold_pct: 5   # 距底部多少以内算一次探底
+    test_count_threshold: 3
+    b_stage:
+      score: 30
+      label: "Accum_B"
+      desc: "多次探底({count}次)"
+    # C阶段：缩量回踩不破底
+    c_stage:
+      window: 20
+      min_from_base_pct: 97  # 不低于底部此百分比
+      vol_window: [60, 20]   # [hist, recent]
+      max_vol_ratio: 0.6
+      score: 25
+      label: "Accum_C"
+      desc: "缩量回踩不破底"
+    # A阶段：止跌缩量
+    a_stage:
+      score: 15
+      label: "Accum_A"
+      desc: "止跌缩量"
+    # 均线粘合加分
+    ma_tight_score: 10
+    # 地量加分
+    dry_vol_score: 10
+
+# ============================================================
+# Phase 价格周期阶段识别
+# ============================================================
+phase:
+  min_bars: 50
+
+  # 近期震荡区间窗口
+  range_window: 60
+  # 突破/跌破判定阈值（百分比）
+  breakout_threshold: 1.0
+
+  # 成交量趋势判定
+  vol_state:
+    shrink_ratio: 0.7
+    expand_ratio: 1.3
+
+  # 阶段判定参数
+  phase_b:
+    max_range_size_pct: 20  # 区间宽度小于此值才判为Phase B
+
+  # 置信度（各阶段默认分）
+  confidence:
+    markup: 88
+    sos_breakout: 88
+    sos_in_range: 82
+    trend_up: 82
+    lps: 85
+    spring: 85
+    compression: 80
+    accum: 72
+    phase_b: 72
+    phase_b_build: 65
+    downtrend: 80
+    upthrust_in_range: 85
+    distribute: 68
+    distribute_early: 60
+    range_trade: 55
