@@ -9,12 +9,14 @@ from data_providers import AkshareProvider
 
 # 因子权重
 WEIGHTS = {
-    "wyckoff": 0.25,
-    "risk_reward": 0.20,
-    "volume": 0.15,
-    "candlestick": 0.10,
-    "sector": 0.15,
-    "momentum": 0.15,
+    "wyckoff": 0.20,
+    "risk_reward": 0.16,
+    "volume": 0.12,
+    "candlestick": 0.07,
+    "sector": 0.11,
+    "momentum": 0.12,
+    "market": 0.12,
+    "relative_strength": 0.10,
 }
 
 # 评分 → 操作映射
@@ -40,7 +42,8 @@ class StockScorer:
 
     def __init__(self, df, price, trend, vol, levels, stop_price, exit_prices,
                  wyckoff_signals=None, wyckoff_phase=None, industry=None,
-                 position=None, symbol=None):
+                 position=None, symbol=None, default_sector_score=None,
+                 market_df=None):
         """
         Args:
             df: DataFrame with OHLCV + ma20/ma50/ma200/atr/atr_pct
@@ -54,6 +57,7 @@ class StockScorer:
             wyckoff_phase: detect_phase() 返回的阶段标签，或 None
             industry: 行业名称，或 None（将自动获取）
             position: {"shares": int, "avg_price": float} 或 None
+            market_df: 大盘指数DataFrame（含close列），用于大盘评分
         """
         self.df = df
         self.latest = df.iloc[-1] if len(df) > 0 else {}
@@ -70,7 +74,9 @@ class StockScorer:
         self.wyckoff_phase = wyckoff_phase or ""
         self.industry = industry
         self.symbol = symbol
+        self.default_sector_score = default_sector_score
         self.position = position or {"shares": 0, "avg_price": 0}
+        self.market_df = market_df
 
     # ─────────────────────── 工具方法 ───────────────────────
 
@@ -346,6 +352,9 @@ class StockScorer:
             except Exception:
                 pass
         if not industry or industry == "其他":
+            if self.default_sector_score is not None:
+                return {"score": self.default_sector_score, "label": self._label(self.default_sector_score),
+                        "detail": f"行业默认分{self.default_sector_score}", "rank_pct": 50}
             return {"score": 50, "label": "中", "detail": "行业未知", "rank_pct": 50}
 
         # 获取行业板块涨跌幅排行
@@ -355,6 +364,9 @@ class StockScorer:
             boards = []
 
         if not boards:
+            if self.default_sector_score is not None:
+                return {"score": self.default_sector_score, "label": self._label(self.default_sector_score),
+                        "detail": f"{industry} (板块数据无,默认{self.default_sector_score})", "rank_pct": 50}
             return {"score": 50, "label": "中", "detail": f"{industry} (板块数据无)", "rank_pct": 50}
 
         # 找所属行业的排名
@@ -365,6 +377,9 @@ class StockScorer:
                 break
 
         if not target:
+            if self.default_sector_score is not None:
+                return {"score": self.default_sector_score, "label": self._label(self.default_sector_score),
+                        "detail": f"{industry} 未在排行中找到(默认{self.default_sector_score})", "rank_pct": 50}
             return {"score": 50, "label": "中", "detail": f"{industry} 未在板块排行中找到", "rank_pct": 50}
 
         rank_pct = target["rank"] / target["total"] * 100
@@ -463,6 +478,132 @@ class StockScorer:
             "rsi": rsi,
         }
 
+    # ─────────────────────── 因子7: 大盘趋势 ───────────────────────
+
+    def score_market(self):
+        """大盘指数趋势评分 (权重14%)"""
+        mdf = self.market_df
+        if mdf is None or len(mdf) < 30:
+            return {"score": 50, "label": "中", "detail": "大盘数据不足", "trend": "未知"}
+
+        closes = mdf["close"].values.astype(float)
+        current = closes[-1]
+
+        # 计算MA
+        ma20 = np.mean(closes[-20:]) if len(closes) >= 20 else current
+        ma50 = np.mean(closes[-50:]) if len(closes) >= 50 else current
+        ma200 = np.mean(closes[-200:]) if len(closes) >= 200 else current
+
+        # 趋势方向
+        trend_dir = "多头" if current > ma50 > ma200 else ("空头" if current < ma50 < ma200 else "震荡")
+
+        score = 50  # 基准
+        details = []
+
+        # MA排列评分
+        if current > ma50 > ma200:
+            score += 20
+            details.append("多头排列 +20")
+        elif current < ma50 < ma200:
+            score -= 15
+            details.append("空头排列 -15")
+        else:
+            details.append("震荡整理")
+
+        # MA gap
+        if ma200 > 0:
+            gap = (ma50 - ma200) / ma200 * 100
+            if gap > 5:
+                score += 10
+                details.append(f"MA gap+{gap:.1f}% +10")
+            elif gap > 0:
+                score += 5
+                details.append(f"MA gap+{gap:.1f}% +5")
+            elif gap > -5:
+                score -= 5
+                details.append(f"MA gap{gap:.1f}% -5")
+            else:
+                score -= 10
+                details.append(f"MA gap{gap:.1f}% -10")
+
+        # 近20日涨幅
+        if len(closes) >= 20:
+            ret_20d = (closes[-1] / closes[-20] - 1) * 100
+            if ret_20d > 5:
+                score += 10
+                details.append(f"近20日+{ret_20d:.1f}% +10")
+            elif ret_20d > 0:
+                score += 3
+            elif ret_20d > -5:
+                score -= 3
+            else:
+                score -= 8
+                details.append(f"近20日{ret_20d:.1f}% -8")
+
+        # 成交量确认（涨有量跌缩量 → 健康）
+        if len(mdf) >= 40:
+            volumes = mdf["volume"].values.astype(float) if "volume" in mdf.columns else np.ones_like(closes) * np.mean(closes)
+            vol_20 = np.mean(volumes[-20:])
+            vol_prior = np.mean(volumes[-40:-20]) if len(volumes) >= 40 else vol_20
+            if vol_20 > vol_prior * 1.2 and ret_20d if len(closes) >= 20 else 0:
+                pass  # 放量上涨已经体现在涨幅加分中
+
+        final = max(0, min(100, score))
+        detail_str = " | ".join(details) if details else trend_dir
+        return {
+            "score": final, "label": self._label(final),
+            "detail": detail_str, "trend": trend_dir,
+        }
+
+    # ─────────────────────── 因子8: 相对强度 ───────────────────────
+
+    def score_relative_strength(self):
+        """相对强度评分: 个股 vs 大盘 (权重10%)
+
+        逆势上涨加分，顺势下跌扣分。衡量个股在市场中的相对表现。
+        """
+        mdf = self.market_df
+        df = self.df
+        if mdf is None or df is None or len(df) < 2 or len(mdf) < 2:
+            return {"score": 50, "label": "中", "detail": "数据不足"}
+
+        try:
+            s_close = df["close"].values.astype(float)
+            m_close = mdf["close"].values.astype(float)
+
+            # 取各序列最后一笔，计算1日/5日/20日相对收益
+            def rel_ret(s_arr, m_arr, n):
+                if len(s_arr) < n + 1 or len(m_arr) < n + 1:
+                    return 0
+                s_ret = (s_arr[-1] / s_arr[-(n+1)] - 1) * 100
+                m_ret = (m_arr[-1] / m_arr[-(n+1)] - 1) * 100
+                return s_ret - m_ret
+
+            d1 = rel_ret(s_close, m_close, 1)
+            d5 = rel_ret(s_close, m_close, 5)  if max(len(s_close), len(m_close)) >= 6 else 0
+            d20 = rel_ret(s_close, m_close, 20) if max(len(s_close), len(m_close)) >= 21 else 0
+
+            def diff_score(diff):
+                if diff > 5: return 15
+                if diff > 2: return 8
+                if diff > 0.5: return 3
+                if diff > -0.5: return 0
+                if diff > -2: return -3
+                if diff > -5: return -8
+                return -15
+
+            total = diff_score(d1) * 0.5 + diff_score(d5) * 0.3 + diff_score(d20) * 0.2
+            score = max(0, min(100, 50 + total))
+
+            parts = []
+            if d1 != 0: parts.append(f"1日{d1:+.1f}%")
+            if d5 != 0: parts.append(f"5日{d5:+.1f}%")
+            if d20 != 0: parts.append(f"20日{d20:+.1f}%")
+            detail = " | ".join(parts) if parts else "与大盘持平"
+            return {"score": score, "label": self._label(score), "detail": detail}
+        except Exception:
+            return {"score": 50, "label": "中", "detail": "计算异常"}
+
     # ─────────────────────── 综合评分 ───────────────────────
 
     def compute(self):
@@ -477,6 +618,8 @@ class StockScorer:
             ("candlestick", self.score_candlestick),
             ("sector", self.score_sector),
             ("momentum", self.score_momentum),
+            ("market", self.score_market),
+            ("relative_strength", self.score_relative_strength),
         ]:
             try:
                 factors[key] = method()

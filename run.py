@@ -16,6 +16,7 @@ from market import MarketAnalyzer
 from data_providers import AkshareProvider
 from news_service import get_top_signal_news, format_news_block, get_market_news, format_market_news_block
 from notifier import push_report, send_serverchan, send_pushplus, send_card, make_div, make_hr, make_note
+from picks_tracker import append_history, generate_report
 
 
 def analyze_stock(symbol, account_value=80000, position=None, market_health=None):
@@ -63,6 +64,23 @@ def analyze_stock(symbol, account_value=80000, position=None, market_health=None
             c.tolist(), h.tolist(), l.tolist(), v.tolist(), trend_dir
         )
 
+    # ── 大盘因子数据 ──
+    market_df = None
+    try:
+        import requests, pandas as pd
+        url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh000001,day,,,500,qfq"
+        r = requests.get(url, timeout=15)
+        data = r.json()
+        klines = data.get("data", {}).get("sh000001", {}).get("qfqday") or data.get("data", {}).get("sh000001", {}).get("day", [])
+        if klines and len(klines) >= 100:
+            rows = []
+            for k in klines:
+                rows.append({"date": pd.Timestamp(k[0]), "open": float(k[1]), "close": float(k[2]),
+                             "high": float(k[3]), "low": float(k[4]), "volume": float(k[5])})
+            market_df = pd.DataFrame(rows)
+    except Exception:
+        pass
+
     # ── 多因子评分 ──
     scoring_result = None
     try:
@@ -71,11 +89,15 @@ def analyze_stock(symbol, account_value=80000, position=None, market_health=None
             df=daily, price=price, trend=trend, vol=vol, levels=levels,
             stop_price=stop_price, exit_prices=exit_prices,
             wyckoff_signals=wyckoff_all_signals, wyckoff_phase=phase_label,
-            position=position, symbol=symbol,
+            position=position, symbol=symbol, market_df=market_df,
         )
         scoring_result = scorer.compute()
     except Exception:
         pass
+
+    # ── 评分完成后重新评估入场信号（含硬约束） ──
+    if scoring_result:
+        entry_check = strategy.entry_check(levels, scoring_result["composite_score"], trend)
 
     # ── 仓位计算（带评分） ──
     pos = strategy.position_plan(
@@ -142,6 +164,7 @@ def analyze_stock(symbol, account_value=80000, position=None, market_health=None
         "score_action": scoring_result["action"] if scoring_result else None,
         "score_level": scoring_result["level"] if scoring_result else None,
         "scoring_result": scoring_result,
+        "trailing_stop": pos.get("trailing_stop", {"active": False}),
     }
 
     # ── 完整报告 ──
@@ -234,7 +257,7 @@ def _save_picks(picks_list):
 
 def run(watch_stocks=None, min_amount=5e8, top_n=15, max_scan=80):
     """一站式：扫盘 + 威科夫 + 板块 + 个股分析"""
-    watch_stocks = watch_stocks or ["002050"]
+    watch_stocks = watch_stocks or ["002050", "600038", "600416"]
 
     today = datetime.now().strftime('%Y-%m-%d %H:%M')
 
@@ -337,8 +360,9 @@ def run(watch_stocks=None, min_amount=5e8, top_n=15, max_scan=80):
         if news_dict:
             print(f"\n{format_news_block(news_dict, name_map)}")
 
-    # 保存今日选股供次日跟踪
+    # 保存今日选股供次日跟踪 + 历史记录
     _save_picks(picks)
+    append_history(picks)
 
     # ====== 4. 大盘分析（提前，供持仓分析参考） ======
     print(f"\n{'─'*62}")
@@ -443,6 +467,7 @@ def run(watch_stocks=None, min_amount=5e8, top_n=15, max_scan=80):
     last_price = 0
     last_pnl = 0
     last_trade = {}
+    position_alerts = []
     for sym in watch_stocks:
         try:
             account = 80000
@@ -451,11 +476,31 @@ def run(watch_stocks=None, min_amount=5e8, top_n=15, max_scan=80):
             if sym == "002050":
                 pos = {"shares": 100, "avg_price": 51.44}
                 label = "三花智控"
+            elif sym == "600038":
+                pos = {"shares": 300, "avg_price": 35.374}
+                label = "中直股份"
+            elif sym == "600416":
+                pos = {"shares": 400, "avg_price": 13.285}
+                label = "湘电股份"
 
             report, name, price, op_panel, trade_data = analyze_stock(sym, account, pos, market_health=health)
             # 存持仓数据供后续推送使用
             last_price = price
             last_trade = trade_data
+            # 收集预警信息
+            if pos and trade_data.get("score") is not None:
+                score = trade_data["score"]
+                stop = trade_data.get("stop_price", 0)
+                p = trade_data["price"]
+                if score < 45:
+                    position_alerts.append(f"  ⚠ {label}: 评分{score} <45，建议减仓")
+                if stop > 0 and p > 0:
+                    dist = (p - stop) / p * 100
+                    if dist < 5:
+                        position_alerts.append(f"  🔴 {label}: 距止损仅{dist:.1f}%，注意风险")
+                ts = trade_data.get("trailing_stop", {})
+                if ts.get("active"):
+                    position_alerts.append(f"  🟢 {label}: {ts['message']}")
             if pos:
                 last_pnl = (price - pos["avg_price"]) * pos["shares"]
             # ── 操作面板（紧凑） ──
@@ -475,6 +520,58 @@ def run(watch_stocks=None, min_amount=5e8, top_n=15, max_scan=80):
 
         except Exception as e:
             print(f"  ✗ {sym} 分析失败: {e}")
+
+    # ── 持仓预警 ──
+    if position_alerts:
+        print(f"\n{'─'*62}")
+        print(f"  预警")
+        print(f"{'─'*62}")
+        for alert in position_alerts:
+            print(alert)
+
+    # ====== 5b. 股票池分析 ======
+    POOL_FILE = os.path.join(os.path.dirname(__file__), "watchlist.json")
+    pool_stocks = []
+    try:
+        with open(POOL_FILE, encoding="utf-8") as f:
+            pool_data = json.load(f)
+            pool_stocks = [s["code"] for s in pool_data.get("stocks", [])]
+    except Exception:
+        pass
+
+    pool_stocks = [s for s in pool_stocks if s not in watch_stocks]
+    if pool_stocks:
+        print(f"\n{'─'*62}")
+        print(f"  股票池")
+        print(f"{'─'*62}")
+        for sym in pool_stocks:
+            try:
+                _, name, price, _, td = analyze_stock(sym, 80000, None, market_health=health)
+                score = td.get("score") or 0
+                action = td.get("score_action", "")
+                trend = td.get("trend", "未知")
+                phase = td.get("phase", "")
+                sig = td.get("signal", "")
+
+                if score >= 65 and trend == "多头":      sug = "逢低建仓"
+                elif score >= 50 and trend == "多头":    sug = "可关注，等回调"
+                elif score >= 50 and trend == "空头":    sug = "等趋势转多"
+                elif score < 50 and trend == "多头":     sug = "观望，趋势偏弱"
+                elif score < 50 and trend == "空头":     sug = "回避"
+                else:                                   sug = "观望"
+
+                print(f"\n  ▼ {name}（{sym}）")
+                print(f"    现价: {price:<8.2f}  评分: {score}/100 {action}")
+                print(f"    {phase:<30} 趋势: {trend}")
+                print(f"    建议: {sug}")
+            except Exception as e:
+                print(f"  ✗ {sym} 分析失败: {e}")
+
+    # ====== 5c. 选股表现追踪 ======
+    try:
+        generate_report()
+    except Exception:
+        pass
 
     # ====== 6. 总结 ======
     bullish = sum(1 for r in s.results if r["trend"] == "多头")
@@ -584,4 +681,4 @@ def run(watch_stocks=None, min_amount=5e8, top_n=15, max_scan=80):
 
 
 if __name__ == "__main__":
-    run(watch_stocks=["002050"])
+    run(watch_stocks=["002050", "600038", "600416"])

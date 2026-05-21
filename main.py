@@ -273,7 +273,7 @@ class Strategy:
             composite_score: 多因子综合评分，None时不调整
         """
         # 入场信号弱时禁止加仓/建仓
-        signal_blocked = entry_status in (None, "", "未知", "观望")
+        signal_blocked = entry_status in (None, "", "未知", "观望", "禁止开仓")
 
         # 大盘环境极差时强行禁止（系统性风险硬限制）
         if market_health and "较差" in market_health:
@@ -311,6 +311,21 @@ class Strategy:
             current_value = self.current_position["shares"] * self.price
             position_ratio = current_value / self.account_value
 
+            # 移动止盈计算
+            trailing_stop = {"active": False, "trigger_price": 0, "message": ""}
+            ap = self.current_position["avg_price"]
+            sp = self.current_position["shares"]
+            if ap > 0 and sp > 0:
+                pnl_pct = (self.price - ap) / ap * 100
+                lookback = min(20, len(self.df))
+                recent_high = self.df["high"].iloc[-lookback:].max()
+                dd_from_high = (recent_high - self.price) / recent_high * 100
+                if pnl_pct > 10 and dd_from_high > 5:
+                    trailing_stop["active"] = True
+                    trailing_stop["trigger_price"] = round(recent_high * 0.95, 2)
+                    trailing_stop["message"] = (f"从高点{recent_high:.2f}回撤{dd_from_high:.1f}%，"
+                                                f"触发移动止盈于{trailing_stop['trigger_price']:.2f}")
+
             return {
                 "current_shares": self.current_position["shares"],
                 "current_avg_price": self.current_position["avg_price"],
@@ -321,6 +336,7 @@ class Strategy:
                 "suggested_total": total_shares,
                 "suggested_avg": round(avg_price, 2),
                 "total_ratio": round((current_value + cost) / self.account_value * 100, 1),
+                "trailing_stop": trailing_stop,
             }
         else:
             # 空仓：新建仓位
@@ -345,13 +361,25 @@ class Strategy:
                 "total_ratio": round(cost / self.account_value * 100, 1),
             }
 
-    def entry_check(self, levels):
+    def entry_check(self, levels, composite_score=None, trend=None):
         """检查入场条件是否触发"""
         result = {
             "signal": "观望",
             "reason": [],
             "conditions": []
         }
+
+        # 硬约束1：空头趋势禁止开新仓
+        if trend and trend.get("direction") == "空头":
+            result["signal"] = "禁止开仓"
+            result["conditions"].append("[N] 趋势为空头，禁止开仓")
+            return result
+
+        # 硬约束2：评分<50禁止开新仓
+        if composite_score is not None and composite_score < 50:
+            result["signal"] = "禁止开仓"
+            result["conditions"].append(f"[N] 评分{composite_score}<50，禁止开仓")
+            return result
 
         # 条件1：价格在支撑位附近
         if levels.get("supports"):
@@ -459,6 +487,7 @@ class Report:
                 "wyckoff": "威科夫信号", "risk_reward": "盈亏比",
                 "volume": "量能分析", "candlestick": "K线形态",
                 "sector": "板块强度", "momentum": "趋势与动量",
+                "market": "大盘趋势", "relative_strength": "相对强度",
             }
             cn = name_map.get(f["key"], f["key"])
             lines.append(f"  {cn:<8} [{f['weight_pct']:>2}%]  {f['score']:>2}分 {f['label']}  {f['detail']}")
