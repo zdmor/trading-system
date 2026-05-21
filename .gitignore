@@ -26,6 +26,8 @@ config.json
 # Runtime data files
 market_log.json
 predictions.json
+score_log.json
+calibration.json
 
 # IDE
 .vscode/

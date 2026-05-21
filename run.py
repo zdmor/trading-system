@@ -615,6 +615,67 @@ def run(watch_stocks=None, min_amount=5e8, top_n=15, max_scan=80):
     except Exception:
         pass
 
+    # ====== 5f. 贝叶斯校准：记录今日评分，检查前次评分结果 ======
+    SCORE_LOG_FILE = os.path.join(os.path.dirname(__file__), "score_log.json")
+    try:
+        from main import record_score_outcome
+
+        # 加载历史评分记录
+        score_log = []
+        if os.path.exists(SCORE_LOG_FILE):
+            with open(SCORE_LOG_FILE, encoding="utf-8") as f:
+                score_log = json.load(f)
+
+        # 【检查】已过期的评分记录 → 记录涨跌结果
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        fetcher_calib = DataFetcher()
+        pending = [s for s in score_log if s.get("outcome") is None]
+        for s in pending:
+            check_days = s.get("check_days", 5)
+            if (datetime.now() - datetime.strptime(s["date"], "%Y-%m-%d")).days < check_days:
+                continue
+            try:
+                daily = fetcher_calib.get_daily(s["symbol"], days=min(check_days + 5, 30))
+                if daily is not None and len(daily) > 1:
+                    current_px = daily["close"].iloc[-1]
+                    outcome_up = current_px >= s["price"]
+                    record_score_outcome(s["score"], outcome_up)
+                    s["outcome"] = "up" if outcome_up else "down"
+                    s["checked_date"] = today_str
+            except Exception:
+                continue
+
+        # 【记录】今日分析的评分（仅限有评分的持仓+股票池）
+        calib_entries = []
+        for sym in watch_stocks:
+            try:
+                _, name, price, _, td = analyze_stock(sym, 80000,
+                    {"shares": 0, "avg_price": 0} if sym not in ("002050", "600038", "600416") else None,
+                    market_health=health)
+                score = td.get("score")
+                if score is not None:
+                    calib_entries.append({
+                        "date": today_str,
+                        "symbol": sym,
+                        "name": name,
+                        "score": score,
+                        "price": price,
+                        "check_days": 5,
+                        "outcome": None,
+                    })
+            except Exception:
+                continue
+        # 合并并去重
+        existing_keys = {(e["date"], e["symbol"]) for e in score_log}
+        for e in calib_entries:
+            if (e["date"], e["symbol"]) not in existing_keys:
+                score_log.append(e)
+
+        with open(SCORE_LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(score_log, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
     # ====== 6. 总结 ======
     bullish = sum(1 for r in s.results if r["trend"] == "多头")
     print(f"\n{'='*62}")

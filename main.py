@@ -280,19 +280,38 @@ class Strategy:
             risk_pct = 0
             signal_blocked = True
 
-        # 多因子评分调整仓位系数
+        # 贝叶斯仓位系数：分数→概率连续映射 + 历史校准
         if composite_score is not None and not signal_blocked:
+            # 连续映射函数：在关键分位匹配原离散值
+            #   30分→0   50分→0.25   65分→0.50   80分→1.0
             if composite_score >= 80:
-                risk_pct = risk_pct * 1.0  # 强加仓：全额风险
+                base_mult = 1.0
             elif composite_score >= 65:
-                risk_pct = risk_pct * 0.5  # 加仓：半仓
+                base_mult = 0.50 + (composite_score - 65) * (0.50 / 15)
             elif composite_score >= 50:
-                risk_pct = risk_pct * 0.25  # 持有：轻仓试探
+                base_mult = 0.25 + (composite_score - 50) * (0.25 / 15)
             elif composite_score >= 30:
-                risk_pct = 0  # 减仓，不加仓
-                signal_blocked = True
+                base_mult = (composite_score - 30) * (0.25 / 20)
             else:
-                risk_pct = 0  # 离场，不加仓
+                base_mult = 0.0
+
+            # 历史校准：根据该分数段的实际胜率修正仓位
+            if base_mult > 0:
+                calib = _load_calibration()
+                bracket = _score_bracket(composite_score)
+                cal = calib.get(bracket, {})
+                accuracy = cal.get("accuracy", 0.5)
+                # 校准系数 = 实际胜率 / 期望胜率
+                # 期望胜率以分数中值为基准（50分→0.5, 80分→0.8）
+                mid = {"50": 50, "60": 60, "70": 70, "80": 85}.get(bracket, 50)
+                expected = mid / 100
+                calib_factor = accuracy / expected if expected > 0 else 1.0
+                calib_factor = max(0.3, min(2.0, calib_factor))  # 限制范围
+                base_mult = base_mult * calib_factor
+                base_mult = max(0.0, min(1.0, base_mult))
+
+            risk_pct = risk_pct * base_mult
+            if risk_pct <= 0:
                 signal_blocked = True
 
         # 硬约束：不在亏损头寸上加仓（不摊平）
@@ -658,6 +677,53 @@ def load_config(symbol):
         except Exception:
             pass
     return {}
+
+
+# ============================================================
+# 贝叶斯校准
+# ============================================================
+
+CALIBRATION_FILE = os.path.join(os.path.dirname(__file__), "calibration.json")
+
+
+def _score_bracket(score):
+    """评分→校准桶（每10分一档）"""
+    if score >= 80: return "80"
+    if score >= 70: return "70"
+    if score >= 60: return "60"
+    return "50"
+
+
+def _load_calibration():
+    """读取历史准确率校准数据"""
+    try:
+        if os.path.exists(CALIBRATION_FILE):
+            with open(CALIBRATION_FILE, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def record_score_outcome(score, outcome_up):
+    """记录评分→实际涨跌，更新校准数据
+
+    Args:
+        score: 综合评分
+        outcome_up: True=上涨, False=下跌
+    """
+    bracket = _score_bracket(score)
+    calib = _load_calibration()
+    bucket = calib.setdefault(bracket, {"count": 0, "correct": 0, "accuracy": 0.5})
+    bucket["count"] += 1
+    if outcome_up:
+        bucket["correct"] += 1
+    bucket["accuracy"] = round(bucket["correct"] / bucket["count"], 4)
+    try:
+        with open(CALIBRATION_FILE, "w", encoding="utf-8") as f:
+            json.dump(calib, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 def main():
