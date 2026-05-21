@@ -573,6 +573,48 @@ def run(watch_stocks=None, min_amount=5e8, top_n=15, max_scan=80):
     except Exception:
         pass
 
+    # ====== 5d. 每日市场观察日志 ======
+    MARKET_LOG_FILE = os.path.join(os.path.dirname(__file__), "market_log.json")
+    try:
+        bullish = sum(1 for r in s.results if r["trend"] == "多头")
+        valid = [r for r in s.results if r["wyckoff_sig"] not in ("-", "无信号", "数据不足", "无数据")]
+        log_entry = {
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "total": len(s.snapshot),
+            "liquid": len(s.candidates),
+            "bullish": bullish,
+            "bullish_pct": round(bullish / max(len(s.candidates), 1) * 100, 1),
+            "health": health,
+            "ad_ratio": breadth["ad_ratio"] if breadth else 0,
+            "total_amt": round(sum(v.get("amount", 0) for v in s.snapshot.values()) / 1e8, 0) if s.snapshot else 0,
+            "signals": {
+                "SOS": sum(1 for r in valid if "SOS" in r["wyckoff_sig"]),
+                "Spring": sum(1 for r in valid if "Spring" in r["wyckoff_sig"]),
+                "弱Spring": sum(1 for r in valid if "弱Spring" in r["wyckoff_sig"]),
+                "Upthrust": sum(1 for r in valid if r["wyckoff_sig"] == "Upthrust"),
+                "EVR": sum(1 for r in valid if "EVR" in r["wyckoff_sig"]),
+                "Compression": sum(1 for r in valid if "Compression" in r["wyckoff_sig"]),
+            },
+        }
+        existing = []
+        if os.path.exists(MARKET_LOG_FILE):
+            with open(MARKET_LOG_FILE, encoding="utf-8") as f:
+                existing = json.load(f)
+        existing = [e for e in existing if e["date"] != log_entry["date"]]
+        existing.append(log_entry)
+        existing.sort(key=lambda x: x["date"])
+        with open(MARKET_LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+    # ====== 5e. 预测验证 ======
+    try:
+        from verify_prediction import verify_all as check_predictions
+        check_predictions()
+    except Exception:
+        pass
+
     # ====== 6. 总结 ======
     bullish = sum(1 for r in s.results if r["trend"] == "多头")
     print(f"\n{'='*62}")

@@ -280,20 +280,25 @@ class Strategy:
             risk_pct = 0
             signal_blocked = True
 
-        # 多因子评分调整仓位系数（替代原有的大盘一般减半逻辑）
+        # 多因子评分调整仓位系数
         if composite_score is not None and not signal_blocked:
             if composite_score >= 80:
-                pass  # 强加仓，全额风险
+                risk_pct = risk_pct * 1.0  # 强加仓：全额风险
             elif composite_score >= 65:
-                risk_pct = risk_pct * 0.7  # 加仓，7成
+                risk_pct = risk_pct * 0.5  # 加仓：半仓
             elif composite_score >= 50:
-                risk_pct = 0  # 持有，不加仓
-                signal_blocked = True
+                risk_pct = risk_pct * 0.25  # 持有：轻仓试探
             elif composite_score >= 30:
                 risk_pct = 0  # 减仓，不加仓
                 signal_blocked = True
             else:
                 risk_pct = 0  # 离场，不加仓
+                signal_blocked = True
+
+        # 硬约束：不在亏损头寸上加仓（不摊平）
+        if self.current_position["shares"] > 0 and self.current_position["avg_price"] > 0:
+            unrealized_pnl_pct = (self.price / self.current_position["avg_price"] - 1) * 100
+            if unrealized_pnl_pct < -2 and not signal_blocked:
                 signal_blocked = True
 
         if self.current_position["shares"] > 0:
@@ -498,8 +503,8 @@ class Report:
         """仓位段落"""
         lines = [self._section("仓位管理")]
         lines.append(f"  账户资金: {self.account_value:,.0f}")
-        lines.append(f"  单笔最大亏损(2%): {self.account_value * 0.02:,.0f}")
-        lines.append(f"  单票上限(70%): {self.account_value * 0.7:,.0f}")
+        lines.append(f"  单笔风险预算: {self.account_value * 0.02:,.0f} (2%)")
+        lines.append(f"  单票上限: {self.account_value * 0.7:,.0f} (70%)")
         lines.append("")
         if current_price is None:
             current_price = pos["current_value"] / max(pos["current_shares"], 1) if pos["current_shares"] > 0 else 0
@@ -508,6 +513,9 @@ class Report:
             lines.append(f"  持仓市值: {pos['current_value']:,.0f}  占比: {pos['position_ratio']}%")
             unrealized = (current_price - pos["current_avg_price"]) * pos["current_shares"]
             lines.append(f"  浮动盈亏: {unrealized:+,.0f}")
+            # 亏损头寸不加仓标记
+            if unrealized < 0 and pos["add_shares"] == 0:
+                lines.append(f"  [规则] 浮亏头寸不加仓")
         else:
             lines.append("  当前持仓: 空仓")
         lines.append("")

@@ -23,6 +23,10 @@ industry_cache.json
 config/scanner.yaml
 config.json
 
+# Runtime data files
+market_log.json
+predictions.json
+
 # IDE
 .vscode/
 .idea/
