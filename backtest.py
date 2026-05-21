@@ -130,8 +130,9 @@ class Backtester:
         trend = strategy.trend_analysis()
         vol = strategy.volatility_analysis()
 
-        recent_lows = df_slice["low"].iloc[-60:].min()
-        stop_price = round(recent_lows * 0.985, 2) if recent_lows > 0 else round(price * 0.93, 2)
+        # 止损位：ATR动态距离
+        atr_val = df_slice["atr"].iloc[-1] if "atr" in df_slice.columns else price * 0.02
+        stop_price = round(price - atr_val * 1.5, 2) if atr_val > 0 else round(price * 0.93, 2)
         exit_prices = [r for r in resistances] if resistances else [round(price * 1.08, 2)]
         entry_check = strategy.entry_check(levels)
 

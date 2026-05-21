@@ -37,8 +37,8 @@ def analyze_stock(symbol, account_value=80000, position=None, market_health=None
     vol = strategy.volatility_analysis()
     entry_check = strategy.entry_check(levels)
 
-    recent_lows = daily["low"].iloc[-60:].min()
-    stop_price = round(recent_lows * 0.985, 2) if recent_lows > 0 else round(price * 0.93, 2)
+    atr_val = daily["atr"].iloc[-1] if "atr" in daily.columns else price * 0.02
+    stop_price = round(price - atr_val * 1.5, 2) if atr_val > 0 else round(price * 0.93, 2)
 
     config = load_config(symbol)
     if "stop_price" in config: stop_price = config["stop_price"]

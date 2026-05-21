@@ -860,9 +860,9 @@ def main():
         vol = strategy.volatility_analysis()
         entry_check = strategy.entry_check(levels)
 
-        # 止损位（近3个月最低点下方一点）
-        recent_lows = daily["low"].iloc[-60:].min()
-        stop_price = round(recent_lows * 0.985, 2) if recent_lows > 0 else round(price * 0.93, 2)
+        # 止损位：ATR动态距离（替代固定比例）
+        atr_val = daily["atr"].iloc[-1] if "atr" in daily.columns else price * 0.02
+        stop_price = round(price - atr_val * 1.5, 2) if atr_val > 0 else round(price * 0.93, 2)
 
         # 配置覆盖（如果config.json中有设定，优先使用）
         if "stop_price" in config:
