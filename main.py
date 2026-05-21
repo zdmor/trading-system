@@ -405,14 +405,16 @@ class Strategy:
             result["conditions"].append(f"[N] 评分{composite_score}<50，禁止开仓")
             return result
 
-        # 条件1：价格在支撑位附近
+        # 条件1：价格在支撑区间（区间代替单线，容忍-1%~+3%）
+        in_support_zone = False
         if levels.get("supports"):
             nearest_support = levels["supports"][-1] if levels["supports"] else 0
             support_distance = (self.price - nearest_support) / self.price * 100
-            if 0 <= support_distance < 2:
-                result["conditions"].append(f"[Y] 价格接近支撑 {nearest_support:.2f}（距离 {support_distance:.1f}%）")
+            if -1 < support_distance < 3:
+                in_support_zone = True
+                result["conditions"].append(f"[Y] 价格在支撑区间 {nearest_support:.2f}（距离 {support_distance:.1f}%）")
             else:
-                result["conditions"].append(f"[N] 价格距支撑 {nearest_support:.2f} 较远（-{abs(support_distance):.1f}%）" if support_distance < 0 else f"[~] 价格距支撑 {nearest_support:.2f} 较远（{support_distance:.1f}%）")
+                result["conditions"].append(f"[~] 价格在支撑区间外 {nearest_support:.2f}（距离 {support_distance:.1f}%）")
 
         # 条件2：趋势为多头
         trend = self.trend_analysis()
@@ -431,15 +433,73 @@ class Strategy:
             else:
                 result["conditions"].append(f"[!] 波动率偏高，扩大止损范围（ATR% {vol['atr_pct']}%）")
 
-        # 综合信号
-        buy_conditions = sum(1 for c in result["conditions"] if c.startswith("[Y]"))
-        total_check = len(result["conditions"])
-        if total_check > 0 and buy_conditions >= total_check - 1:
+        # 条件4：假突破检测（流动性抓取）
+        false_break = self._detect_false_breakout(levels)
+        if false_break["signal"] == "bullish":
+            result["conditions"].append(f"[Y] 假跌破/流动性抓取 — {false_break['detail']}")
+            # 自动升级信号：假突破是强入场信号
             result["signal"] = "可入场"
-        elif buy_conditions >= total_check / 2:
-            result["signal"] = "等待确认"
+        elif false_break["signal"] == "bearish":
+            result["conditions"].append(f"[!] 假突破/阻力测试失败 — {false_break['detail']}")
         else:
-            result["signal"] = "观望"
+            result["conditions"].append(f"[~] 无假突破信号")
+
+        # 综合信号（如果未被假突破覆盖）
+        if result["signal"] != "可入场":
+            buy_conditions = sum(1 for c in result["conditions"] if c.startswith("[Y]"))
+            total_check = len(result["conditions"])
+            if total_check > 0 and buy_conditions >= total_check - 1:
+                result["signal"] = "可入场"
+            elif buy_conditions >= total_check / 2:
+                result["signal"] = "等待确认"
+            else:
+                result["signal"] = "观望"
+
+        return result
+
+    def _detect_false_breakout(self, levels):
+        """检测假突破/流动性抓取信号"""
+        df = self.df
+        result = {"signal": "none", "detail": ""}
+
+        if len(df) < 5:
+            return result
+
+        # 取最近N根K线
+        recent = df.iloc[-5:]
+        current_close = recent["close"].iloc[-1]
+
+        # 检查支撑位假跌破
+        supports = levels.get("supports", [])
+        if supports:
+            key_level = supports[-1]  # 最近支撑
+            lows = recent["low"].values
+            closes = recent["close"].values
+            # 有任意K线最低价跌破支撑，但最新收盘价在支撑之上
+            broke_below = any(l < key_level for l in lows)
+            closed_above = current_close > key_level
+            if broke_below and closed_above:
+                min_low = min(lows)
+                wick_depth = (key_level - min_low) / key_level * 100
+                result["signal"] = "bullish"
+                result["detail"] = f"支撑{key_level:.2f}下影{wick_depth:.1f}%后收回"
+                return result
+
+        # 检查阻力位假突破
+        resistances = levels.get("resistances", [])
+        if resistances:
+            key_level = resistances[0]  # 最近阻力
+            highs = recent["high"].values
+            closes = recent["close"].values
+            # 有任意K线最高价突破阻力，但最新收盘价在阻力之下
+            broke_above = any(h > key_level for h in highs)
+            closed_below = current_close < key_level
+            if broke_above and closed_below:
+                max_high = max(highs)
+                wick_height = (max_high - key_level) / key_level * 100
+                result["signal"] = "bearish"
+                result["detail"] = f"阻力{key_level:.2f}上影{wick_height:.1f}%后回落"
+                return result
 
         return result
 

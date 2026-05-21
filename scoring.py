@@ -254,9 +254,35 @@ class StockScorer:
 
         final = max(0, min(100, base))
         vol_trend_str = f"{'上升' if vol_trend >= 1.05 else '下降' if vol_trend <= 0.95 else '持平'}"
+        detail_parts = [f"量比{vol_ratio:.1f}倍 量趋势{vol_trend_str}"]
+
+        # ── 突破确认：关键位+放量=有效，关键位+缩量=假突破 ──
+        if self.supports:
+            nearest_s = self.supports[-1]
+            dist_s = (nearest_s - self.price) / self.price * 100
+            if dist_s < 0 and abs(dist_s) < 3:
+                if vol_ratio >= 1.5:
+                    base -= 15
+                    detail_parts.append("放量破支撑 -15")
+                elif vol_ratio < 0.8:
+                    base += 12
+                    detail_parts.append("缩量假跌破 +12")
+
+        if self.resistances:
+            nearest_r = self.resistances[0]
+            dist_r = (self.price - nearest_r) / self.price * 100
+            if dist_r > 0 and abs(dist_r) < 3:
+                if vol_ratio >= 1.5:
+                    base += 15
+                    detail_parts.append("放量破阻力 +15")
+                elif vol_ratio < 0.8:
+                    base -= 12
+                    detail_parts.append("缩量假突破 -12")
+
+        final = max(0, min(100, base))
         return {
             "score": final, "label": self._label(final),
-            "detail": f"量比{vol_ratio:.1f}倍 量趋势{vol_trend_str}",
+            "detail": " | ".join(detail_parts),
             "vol_ratio": round(vol_ratio, 2),
         }
 
