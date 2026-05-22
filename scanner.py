@@ -1098,12 +1098,12 @@ class Scanner:
             analysis = self._analyze_stock(stock["code"])
             results.append({**stock, **analysis})
             if (i + 1) % 10 == 0 and total > 10:
-                sys.stdout.write(f"\r  ⏳ 分析进度: {i+1}/{total}")
+                sys.stdout.write(f"\r  分析进度: {i+1}/{total}")
                 sys.stdout.flush()
             time.sleep(stock_interval)
 
         if total > 10:
-            sys.stdout.write(f"\r  ⏳ 分析进度: {total}/{total}\n")
+            sys.stdout.write(f"\r  分析进度: {total}/{total}\n")
             sys.stdout.flush()
 
         # 排序：威科夫信号得分 > 多头 > 成交额
