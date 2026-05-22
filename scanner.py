@@ -20,6 +20,14 @@ import warnings
 warnings.filterwarnings("ignore")
 
 from data_providers import AkshareProvider
+from data_providers import get_financial_indicators, get_stock_quality, get_sector_heat, get_industry_map as dp_get_industry_map
+from data_providers.tushare_provider import TushareProvider
+
+try:
+    from research_watchlist import ResearchTracker
+    _RESEARCH_TOOL = True
+except ImportError:
+    _RESEARCH_TOOL = False
 
 
 # ============================================================
@@ -813,7 +821,7 @@ class Scanner:
             try:
                 print("  (AKShare 行业分类)...", end=" ")
                 t0 = time.time()
-                self.industry_map = AkshareProvider.get_industry_map()
+                self.industry_map = dp_get_industry_map()
                 if self.industry_map:
                     print(f"{len(self.industry_map)} 只 ({time.time()-t0:.1f}s)")
                     self._save_industry_cache()
@@ -1010,7 +1018,7 @@ class Scanner:
         return result
 
     def enrich_with_financials(self, stocks_with_sigs, max_items=None):
-        """对威科夫信号股票补充基本面数据（PE/PB/ROE/市值）"""
+        """对威科夫信号股票补充基本面（PE/PB/ROE/市值）+ 筹码分布"""
         analysis_cfg = self._sc.get("analysis", {})
         max_items = max_items or analysis_cfg.get("financial_batch_size", 10)
         fin_interval = analysis_cfg.get("financial_interval", 0.3)
@@ -1018,16 +1026,66 @@ class Scanner:
         for s in stocks_with_sigs[:max_items]:
             try:
                 code = s["code"].split(".")[1] if "." in s["code"] else s["code"]
-                fin = AkshareProvider.get_financial_indicators(code)
+                fin = get_financial_indicators(code)
                 s["pe"] = fin.get("pe")
                 s["pb"] = fin.get("pb")
                 s["roe"] = fin.get("roe")
                 s["total_mv"] = fin.get("total_mv")
+                # 筹码分布
+                ts_code = code + ".SZ" if not code.startswith("6") else code + ".SH"
+                chips = TushareProvider.get_chip_distribution(ts_code)
+                s["chip_support"] = chips.get("chip_support")
+                s["chip_resistance"] = chips.get("chip_resistance")
+                s["chip_current"] = chips.get("current_price")
             except Exception:
                 s["pe"] = s["pb"] = s["roe"] = s["total_mv"] = None
+                s["chip_support"] = s["chip_resistance"] = None
             enriched.append(s)
             time.sleep(fin_interval)
         return enriched
+
+    def enrich_with_quality(self, stocks_with_sigs, max_items=None):
+        """
+        个股质地检查（第三层过滤）: ROE/营收/质押/商誉/ST
+        对评分前N的候选股运行，标记 quality_passed
+        深度研究确认的个股可跳过部分检查
+        """
+        ac = self._sc.get("analysis", {})
+        rt = self._sc.get("research_tracker", {})
+        max_items = max_items or ac.get("quality_batch_size", 30)
+        checked = 0
+        passed = 0
+        for s in stocks_with_sigs[:max_items]:
+            try:
+                code = s["code"].split(".")[1] if "." in s["code"] else s["code"]
+                q = get_stock_quality(code)
+
+                # 深度研究个股: 跳过部分检查
+                if _RESEARCH_TOOL and rt.get("enabled", True):
+                    bypass = ResearchTracker.get_quality_bypass(code)
+                    if bypass.get("roe") and q.get("checks", {}).get("roe_qualified") is False:
+                        q["checks"]["roe_qualified"] = True
+                    if bypass.get("revenue") and q.get("checks", {}).get("revenue_growing") is False:
+                        q["checks"]["revenue_growing"] = True
+                    q["all_passed"] = all(q.get("checks", {}).values())
+
+                s["quality"] = q.get("checks", {})
+                s["quality_passed"] = q.get("all_passed", False)
+                # 复制几个关键指标方便展示
+                for k in ("roe_3y_ok", "revenue_yoy", "pledge_ratio", "debt_to_assets", "roe"):
+                    if k in q:
+                        s[k] = q[k]
+                checked += 1
+                if s["quality_passed"]:
+                    passed += 1
+            except Exception:
+                s["quality"] = {}
+                s["quality_passed"] = True  # 数据异常不拦截
+            time.sleep(0.3)  # 防 Tushare 限频
+        if checked:
+            sys.stdout.write(f"\r  质地检查: {checked}只, 通过{passed}只, 排除{checked-passed}只\n")
+            sys.stdout.flush()
+        return stocks_with_sigs
 
     def run_analysis(self, max_stocks=None):
         analysis_cfg = self._sc.get("analysis", {})
@@ -1088,6 +1146,13 @@ class Scanner:
         print(f"  多头: {bullish}只  ", end="")
         for k, v in sig_counts.items():
             print(f" {k}:{v}只 ", end="")
+
+        # 质地通过率
+        quality_checked = [r for r in self.results if r.get("quality_passed") is not None]
+        if quality_checked:
+            passed = sum(1 for r in quality_checked if r["quality_passed"])
+            pct = passed / len(quality_checked) * 100
+            print(f"\n  质地检查: {len(quality_checked)}只 通过{passed}只 ({pct:.0f}%)", end="")
         print("\n")
 
         if not self.results:
@@ -1109,19 +1174,43 @@ class Scanner:
         sorted_sec = sorted(sectors.items(), key=lambda x: -x[1]["count"])
         print(f"  【板块分布】")
         for ind, info in sorted_sec[:12]:
-            tag = f" 🌱{info['sig_count']}信号" if info['sig_count'] > 0 else ""
+            tag = f" S{info['sig_count']}信号" if info['sig_count'] > 0 else ""
             top = ", ".join(info["names"])
             print(f"  {ind:<18} {info['count']:>2}只{tag:<12} | {top}")
+
+        # 板块景气度 Top5（可选）
+        rt_cfg = self._sc.get("sector_heat", {})
+        if rt_cfg.get("enabled", True):
+            print(f"  【板块景气度 Top5】")
+            for ind, info in sorted_sec[:5]:
+                try:
+                    heat = get_sector_heat(ind)
+                    if heat and heat.get("composite"):
+                        hl = heat["level"]
+                        print(f"  {ind:<18} 热度{heat['composite']:>2}/100 ({hl})")
+                except Exception:
+                    pass
+
         print()
 
         # === Top N ===
         print(f"  [Top {top_n}]")
-        print(f"  {'#':<3} {'代码':<8} {'名称':<7} {'板块':<12} {'趋势':<10} {'威科夫':<18} {'价格':<8} {'成交额':<8}")
-        print(f"  " + "-" * 96)
+        print(f"  {'#':<3} {'代码':<8} {'名称':<7} {'板块':<12} {'趋势':<10} {'威科夫':<18} {'价格':<8} {'成交额':<8} {'质地':<6}")
+        print(f"  " + "-" * 105)
 
         for i, r in enumerate(self.results[:top_n]):
             sym = r["code"].split(".")[1]
             name = r["name"][:6]
+
+            # 深度研究个股标记
+            rt_cfg = self._sc.get("research_tracker", {})
+            if _RESEARCH_TOOL and rt_cfg.get("enabled", True):
+                try:
+                    if ResearchTracker.is_confirmed(sym):
+                        name += rt_cfg.get("display_marker", "R")
+                except Exception:
+                    pass
+
             ind = r.get("industry", "其他")[:10]
             trend = f"{r['trend']}({r['strength']:+.1f}%)" if r["trend"] in ("多头", "空头") else r["trend"]
 
@@ -1131,28 +1220,39 @@ class Scanner:
 
             price = f"{r['price']:.2f}"
             amt = f"{r['amount']/1e8:.1f}亿"
-            print(f"  {i+1:<3} {sym:<8} {name:<7} {ind:<12} {trend:<10} {sig_str:<18} {price:<8} {amt:<8}")
+            qf = "通过" if r.get("quality_passed") else ("未检" if r.get("quality_passed") is None else "未过")
+            print(f"  {i+1:<3} {sym:<8} {name:<7} {ind:<12} {trend:<10} {sig_str:<18} {price:<8} {amt:<8} {qf:<6}")
 
         print()
 
-        # === 信号精选 ===
+        # === 信号精选（仅展示通过质地的） ===
         valid = [r for r in self.results if r["wyckoff_sig"] not in ("-", "无信号", "数据不足", "无数据")]
         if valid:
-            # 补充基本面数据
-            enriched = self.enrich_with_financials(valid, 10)
-            print(f"  【威科夫信号精选 Top {min(10, len(valid))}】")
-            print(f"  {'信号':<14} {'代码':<8} {'名称':<7} {'板块':<12} {'得分':<5} {'PE':<7} {'ROE':<6} {'细节':<24}")
-            print(f"  " + "-" * 88)
-            for r in enriched[:10]:
-                sym = r["code"].split(".")[1]
-                name = r["name"][:6]
-                ind = r.get("industry", "其他")[:10]
-                sig = r["wyckoff_sig"]
-                sc = r["wyckoff_score"]
-                pe = f"{r['pe']:.1f}" if r.get("pe") else "-"
-                roe = f"{r['roe']:.1f}%" if r.get("roe") else "-"
-                detail = r.get("wyckoff_detail", "")[:24]
-                print(f"  {sig:<14} {sym:<8} {name:<7} {ind:<12} {sc:<5} {pe:<7} {roe:<6} {detail:<24}")
+            # 对信号股票补充基本面 + 质地
+            quality_ok = [r for r in valid if r.get("quality_passed") == True]
+            if quality_ok:
+                enriched = self.enrich_with_financials(quality_ok, 10)
+                print(f"  【威科夫信号精选（质地通过）Top {min(10, len(quality_ok))}】")
+                print(f"  {'信号':<14} {'代码':<8} {'名称':<7} {'板块':<12} {'得分':<5} {'PE':<7} {'ROE':<6} {'细节':<24}")
+                print(f"  " + "-" * 88)
+                for r in enriched[:10]:
+                    sym = r["code"].split(".")[1]
+                    name = r["name"][:6]
+                    ind = r.get("industry", "其他")[:10]
+                    sig = r["wyckoff_sig"]
+                    sc = r["wyckoff_score"]
+                    pe = f"{r['pe']:.1f}" if r.get("pe") else "-"
+                    roe = f"{r['roe']:.1f}%" if r.get("roe") else "-"
+                    detail = r.get("wyckoff_detail", "")[:24]
+                    print(f"  {sig:<14} {sym:<8} {name:<7} {ind:<12} {sc:<5} {pe:<7} {roe:<6} {detail:<24}")
+            else:
+                # 有信号但无质地通过的：展示质量失败原因
+                print(f"  【威科夫信号 {len(valid)}只，但均未通过个股质地检查】")
+                for r in valid[:5]:
+                    q = r.get("quality", {})
+                    fails = [k for k, v in q.items() if v == False]
+                    print(f"  {r['name']:<6} {r['code']:<12} 排除: {','.join(fails)}")
+            print()
             print()
 
         # === 概念板块热度 ===
@@ -1211,6 +1311,10 @@ class Scanner:
             t0 = time.time()
             self.run_analysis(max_analysis)
             print(f"  完成 ({time.time()-t0:.1f}s)")
+
+            # [3.5/3] 个股质地检查（第三层，仅标记不过滤）
+            print("[3.5/3] 个股质地检查 (Tushare)...")
+            self.enrich_with_quality(self.results)
 
         self.print_report(top_n)
 

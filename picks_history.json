@@ -46,5 +46,149 @@
     "signal": "Spring",
     "score": 64,
     "price": 1038.04
+  },
+  {
+    "date": "2026-05-22",
+    "code": "000417",
+    "name": "合百集团",
+    "signal": "SOS",
+    "score": 75,
+    "price": 9.75
+  },
+  {
+    "date": "2026-05-22",
+    "code": "000725",
+    "name": "京东方Ａ",
+    "signal": "EVR",
+    "score": 80,
+    "price": 4.67
+  },
+  {
+    "date": "2026-05-22",
+    "code": "002463",
+    "name": "沪电股份",
+    "signal": "Spring",
+    "score": 58,
+    "price": 103.7
+  },
+  {
+    "date": "2026-05-22",
+    "code": "002600",
+    "name": "领益智造",
+    "signal": "SOS",
+    "score": 75,
+    "price": 16.29
+  },
+  {
+    "date": "2026-05-22",
+    "code": "300033",
+    "name": "同花顺",
+    "signal": "SOS",
+    "score": 75,
+    "price": 236.2
+  },
+  {
+    "date": "2026-05-22",
+    "code": "300769",
+    "name": "德方纳米",
+    "signal": "Spring",
+    "score": 65,
+    "price": 74.0
+  },
+  {
+    "date": "2026-05-22",
+    "code": "301013",
+    "name": "利和兴",
+    "signal": "SOS",
+    "score": 93,
+    "price": 38.9
+  },
+  {
+    "date": "2026-05-22",
+    "code": "600160",
+    "name": "巨化股份",
+    "signal": "SOS",
+    "score": 70,
+    "price": 35.16
+  },
+  {
+    "date": "2026-05-22",
+    "code": "600176",
+    "name": "中国巨石",
+    "signal": "Spring",
+    "score": 57,
+    "price": 35.52
+  },
+  {
+    "date": "2026-05-22",
+    "code": "600246",
+    "name": "万通发展",
+    "signal": "SOS",
+    "score": 83,
+    "price": 15.41
+  },
+  {
+    "date": "2026-05-22",
+    "code": "600487",
+    "name": "亨通光电",
+    "signal": "Spring",
+    "score": 57,
+    "price": 69.9
+  },
+  {
+    "date": "2026-05-22",
+    "code": "600580",
+    "name": "卧龙电驱",
+    "signal": "SOS",
+    "score": 67,
+    "price": 40.66
+  },
+  {
+    "date": "2026-05-22",
+    "code": "600895",
+    "name": "张江高科",
+    "signal": "EVR",
+    "score": 70,
+    "price": 37.31
+  },
+  {
+    "date": "2026-05-22",
+    "code": "603005",
+    "name": "晶方科技",
+    "signal": "EVR",
+    "score": 70,
+    "price": 36.08
+  },
+  {
+    "date": "2026-05-22",
+    "code": "603179",
+    "name": "新泉股份",
+    "signal": "SOS",
+    "score": 83,
+    "price": 61.94
+  },
+  {
+    "date": "2026-05-22",
+    "code": "605111",
+    "name": "新洁能",
+    "signal": "SOS",
+    "score": 73,
+    "price": 56.74
+  },
+  {
+    "date": "2026-05-22",
+    "code": "688322",
+    "name": "奥比中光",
+    "signal": "SOS",
+    "score": 70,
+    "price": 113.91
+  },
+  {
+    "date": "2026-05-22",
+    "code": "688498",
+    "name": "源杰科技",
+    "signal": "Spring",
+    "score": 64,
+    "price": 1038.04
   }
 ]

@@ -14,12 +14,13 @@ from scanner import Scanner, WyckoffAnalyzer
 from main import DataFetcher, Analyzer, Strategy, Report, load_config
 from market import MarketAnalyzer
 from data_providers import AkshareProvider
+from data_providers import get_financial_indicators, get_stock_moneyflow
 from news_service import get_top_signal_news, format_news_block, get_market_news, format_market_news_block
 from notifier import push_report, send_serverchan, send_pushplus, send_card, make_div, make_hr, make_note
 from picks_tracker import append_history, generate_report
 
 
-def analyze_stock(symbol, account_value=80000, position=None, market_health=None):
+def analyze_stock(symbol, account_value=80000, position=None, market_health=None, pe_cap=None):
     """分析单只股票，返回 (report_text, name, price, op_panel, trade_data)"""
     fetcher = DataFetcher()
     daily = fetcher.get_daily(symbol, days=400)
@@ -103,7 +104,8 @@ def analyze_stock(symbol, account_value=80000, position=None, market_health=None
     pos = strategy.position_plan(
         stop_price, entry_status=entry_check.get("signal"),
         market_health=market_health,
-        composite_score=scoring_result["composite_score"] if scoring_result else None
+        composite_score=scoring_result["composite_score"] if scoring_result else None,
+        pe_cap=pe_cap,
     )
 
     # ── 操作面板（紧凑摘要） ──
@@ -171,8 +173,8 @@ def analyze_stock(symbol, account_value=80000, position=None, market_health=None
     report = Report(symbol, name, account_value, price_date)
     phase_str = f"\n  【威科夫阶段】\n  {phase_label}\n  {phase_detail}" if phase_label else ""
     output = report.header()
-    fin_metrics = AkshareProvider.get_financial_indicators(symbol)
-    moneyflow = AkshareProvider.get_stock_moneyflow(symbol)
+    fin_metrics = get_financial_indicators(symbol)
+    moneyflow = get_stock_moneyflow(symbol)
     output += report.financial_section(fin_metrics)
     output += report.moneyflow_section(moneyflow)
     output += phase_str
@@ -255,7 +257,7 @@ def _save_picks(picks_list):
         pass
 
 
-def run(watch_stocks=None, min_amount=5e8, top_n=15, max_scan=80):
+def run(watch_stocks=None, min_amount=5e8, top_n=15, max_scan=200):
     """一站式：扫盘 + 威科夫 + 板块 + 个股分析"""
     watch_stocks = watch_stocks or ["002050", "600038", "600416"]
 
@@ -306,15 +308,17 @@ def run(watch_stocks=None, min_amount=5e8, top_n=15, max_scan=80):
     print(f"{'─'*62}")
     valid = [r for r in s.results if r["wyckoff_sig"] not in ("-", "无信号", "数据不足", "无数据")]
     if valid:
-        print(f"  {'信号':<12} {'代码':<8} {'名称':<7} {'板块':<12} {'得分':<5} {'阶段':<22} 细节")
-        print(f"  {'-'*70}")
-        for r in valid[:10]:
+        # 补充筹码数据
+        enriched = s.enrich_with_financials(valid, 10)
+        print(f"  {'信号':<10} {'代码':<8} {'名称':<6} {'得分':<4} {'现价':<7} {'支撑':<7} {'阻力':<7} {'阶段':<22}")
+        print(f"  {'-'*72}")
+        for r in enriched[:10]:
             sym = r["code"].split(".")[1]
             sig = r["wyckoff_sig"]
-            ind = r.get("industry", "")[:10]
             ph = r.get("phase", "")[:20]
-            detail = r.get("wyckoff_detail", "")[:22]
-            print(f"  {sig:<12} {sym:<8} {r['name']:<7} {ind:<12} {r['wyckoff_score']:<5} {ph:<22} {detail}")
+            support = f"{r.get('chip_support',''):<7}" if r.get('chip_support') else "-"+" "*6
+            resist = f"{r.get('chip_resistance',''):<7}" if r.get('chip_resistance') else "-"+" "*6
+            print(f"  {sig:<10} {sym:<8} {r['name']:<6} {r['wyckoff_score']:<4} {r['price']:<7.2f} {support:<7} {resist:<7} {ph:<22}")
     else:
         print(f"  （今日无显著信号）")
 
@@ -339,17 +343,19 @@ def run(watch_stocks=None, min_amount=5e8, top_n=15, max_scan=80):
              and r["trend"] == "多头"]
     picks.sort(key=lambda x: -x["wyckoff_score"])
     if picks:
+        picks = s.enrich_with_financials(picks, 8)
         print(f"\n{'─'*62}")
         print(f"  今日选股推荐（买入信号+多头趋势）")
         print(f"{'─'*62}")
-        print(f"  {'#':<3} {'代码':<8} {'名称':<7} {'板块':<12} {'信号':<10} {'得分':<5} {'现价':<8} {'成交额':<10}")
-        print(f"  {'-'*62}")
+        print(f"  {'#':<3} {'代码':<8} {'名称':<7} {'信号':<8} {'得分':<4} {'现价':<7} {'支撑':<7} {'阻力':<7} {'成交额':<10}")
+        print(f"  {'-'*65}")
         for i, r in enumerate(picks[:8]):
             sym = r["code"].split(".")[1]
-            ind = r.get("industry", "")[:10]
             sig = r["wyckoff_sig"]
             amt = f"{r['amount']/1e8:.1f}亿"
-            print(f"  {i+1:<3} {sym:<8} {r['name']:<7} {ind:<12} {sig:<10} {r['wyckoff_score']:<5} {r['price']:<8.2f} {amt:<10}")
+            support = f"{r.get('chip_support',''):<7}" if r.get('chip_support') else "-"+" "*6
+            resist = f"{r.get('chip_resistance',''):<7}" if r.get('chip_resistance') else "-"+" "*6
+            print(f"  {i+1:<3} {sym:<8} {r['name']:<7} {sig:<8} {r['wyckoff_score']:<4} {r['price']:<7.2f} {support:<7} {resist:<7} {amt:<10}")
     else:
         print(f"\n  （今日无符合条件的买入信号）")
 
@@ -451,6 +457,12 @@ def run(watch_stocks=None, min_amount=5e8, top_n=15, max_scan=80):
     for w in warns:
         print(f"    ⚠ {w}")
 
+    # ── 全市场PE分位（宏观水位线） ──
+    pe_info, pe_cap = MarketAnalyzer.get_pe_percentile()
+    if pe_info:
+        print(f"\n  【宏观估值】")
+        print(f"  上证PE(TTM): {pe_info['pe']} | 近5年分位: {pe_info['percentile']}% | 判定: {pe_info['level']}")
+
     # ── 概念板块 Top5（AKShare） ──
     concepts = MarketAnalyzer.get_concept_boards_top(5)
     if concepts:
@@ -483,7 +495,7 @@ def run(watch_stocks=None, min_amount=5e8, top_n=15, max_scan=80):
                 pos = {"shares": 400, "avg_price": 13.285}
                 label = "湘电股份"
 
-            report, name, price, op_panel, trade_data = analyze_stock(sym, account, pos, market_health=health)
+            report, name, price, op_panel, trade_data = analyze_stock(sym, account, pos, market_health=health, pe_cap=pe_cap)
             # 存持仓数据供后续推送使用
             last_price = price
             last_trade = trade_data
@@ -546,7 +558,7 @@ def run(watch_stocks=None, min_amount=5e8, top_n=15, max_scan=80):
         print(f"{'─'*62}")
         for sym in pool_stocks:
             try:
-                _, name, price, _, td = analyze_stock(sym, 80000, None, market_health=health)
+                _, name, price, _, td = analyze_stock(sym, 80000, None, market_health=health, pe_cap=pe_cap)
                 score = td.get("score") or 0
                 action = td.get("score_action", "")
                 trend = td.get("trend", "未知")
@@ -629,19 +641,19 @@ def run(watch_stocks=None, min_amount=5e8, top_n=15, max_scan=80):
         # 【检查】已过期的评分记录 → 记录涨跌结果
         today_str = datetime.now().strftime("%Y-%m-%d")
         fetcher_calib = DataFetcher()
-        pending = [s for s in score_log if s.get("outcome") is None]
-        for s in pending:
-            check_days = s.get("check_days", 5)
-            if (datetime.now() - datetime.strptime(s["date"], "%Y-%m-%d")).days < check_days:
+        pending = [rec for rec in score_log if rec.get("outcome") is None]
+        for rec in pending:
+            check_days = rec.get("check_days", 5)
+            if (datetime.now() - datetime.strptime(rec["date"], "%Y-%m-%d")).days < check_days:
                 continue
             try:
-                daily = fetcher_calib.get_daily(s["symbol"], days=min(check_days + 5, 30))
+                daily = fetcher_calib.get_daily(rec["symbol"], days=min(check_days + 5, 30))
                 if daily is not None and len(daily) > 1:
                     current_px = daily["close"].iloc[-1]
-                    outcome_up = current_px >= s["price"]
-                    record_score_outcome(s["score"], outcome_up)
-                    s["outcome"] = "up" if outcome_up else "down"
-                    s["checked_date"] = today_str
+                    outcome_up = current_px >= rec["price"]
+                    record_score_outcome(rec["score"], outcome_up)
+                    rec["outcome"] = "up" if outcome_up else "down"
+                    rec["checked_date"] = today_str
             except Exception:
                 continue
 
@@ -651,7 +663,7 @@ def run(watch_stocks=None, min_amount=5e8, top_n=15, max_scan=80):
             try:
                 _, name, price, _, td = analyze_stock(sym, 80000,
                     {"shares": 0, "avg_price": 0} if sym not in ("002050", "600038", "600416") else None,
-                    market_health=health)
+                    market_health=health, pe_cap=pe_cap)
                 score = td.get("score")
                 if score is not None:
                     calib_entries.append({
@@ -687,6 +699,10 @@ def run(watch_stocks=None, min_amount=5e8, top_n=15, max_scan=80):
         print(f"  大盘: {ad_dir}  涨跌比{breadth['ad_ratio']} | 涨停{breadth['limit_up']}跌停{breadth['limit_down']}")
         print(f"       成交{total_amt:.0f}亿 | 健康度: {health}")
     print(f"  全市场: {len(s.snapshot)}只 | 流动性达标: {len(s.candidates)}只 | 多头趋势: {bullish}只")
+    # 高分候选数（评分>=65的买入信号+多头）
+    quality_count = sum(1 for r in s.results if r["wyckoff_sig"] in buy_signals
+                        and r["trend"] == "多头" and r["wyckoff_score"] >= 65)
+    print(f"  高分候选: {quality_count}只（评分>=65+买入信号+多头）")
     print(f"  威科夫信号: SOS {sum(1 for r in valid if 'SOS' in r['wyckoff_sig'])}只"
           f"  Spring {sum(1 for r in valid if 'Spring' in r['wyckoff_sig'])}只"
           f"  Upthrust {sum(1 for r in valid if 'Upthrust' in r['wyckoff_sig'])}只"
@@ -718,69 +734,58 @@ def run(watch_stocks=None, min_amount=5e8, top_n=15, max_scan=80):
         webhook_url = ""
 
     if pushplus_token or serverchan_key or webhook_url:
-        ad_dir = "上涨" if breadth and breadth['advance'] > breadth['decline'] else "下跌"
-        health_str = health if health else "N/A"
-        signal_counts = (
-            f"SOS {sum(1 for r in valid if 'SOS' in r['wyckoff_sig'])} | "
-            f"Spring {sum(1 for r in valid if 'Spring' in r['wyckoff_sig'])} | "
-            f"Upthrust {sum(1 for r in valid if 'Upthrust' in r['wyckoff_sig'])} | "
-            f"LPS {sum(1 for r in valid if 'LPS' in r['wyckoff_sig'])} | "
-            f"EVR {sum(1 for r in valid if 'EVR' in r['wyckoff_sig'])} | "
-            f"Compression {sum(1 for r in valid if 'Compression' in r['wyckoff_sig'])}"
-        )
-        pick_lines = ""
-        for i, r in enumerate(picks[:5]):
+        # 默认静默：只在高评分买入信号或有持仓时推送
+        high_quality = [r for r in picks if r["wyckoff_score"] >= 65]
+        has_holdings = last_trade is not None and last_trade.get("shares", 0) > 0
+        # 持仓股出现卖出信号时单独提醒
+        sell_alerts = []
+        for r in valid:
             sym = r["code"].split(".")[1]
-            pick_lines += f"\n  {i+1}. {r['name']}({sym}) {r['wyckoff_sig']} 评分{r['wyckoff_score']}"
+            if sym in watch_stocks and r["wyckoff_sig"] in ("Upthrust", "EVR"):
+                sell_alerts.append(f"{r['name']}({sym}) {r['wyckoff_sig']} 评分{r['wyckoff_score']}")
+        if not high_quality and not has_holdings and not track_results and not sell_alerts:
+            pass  # 静默
+        else:
+            ad_dir = "上涨" if breadth and breadth['advance'] > breadth['decline'] else "下跌"
+            health_str = health if health else "N/A"
+            detail = f"大盘: {ad_dir} | 健康度: {health_str}\n"
 
-        # ── 大盘概要 ──
-        detail = (
-            f"大盘: {ad_dir} | 健康度: {health_str}\n"
-            f"信号分布: {signal_counts}\n"
-            f"多头趋势: {bullish}只\n"
-            f"选股推荐:{pick_lines}"
-        )
+            if sell_alerts:
+                detail += "\n⚠ 持仓卖出信号 ⚠"
+                for a in sell_alerts:
+                    detail += f"\n  {a}"
 
-        # ── 选股回顾 ──
-        if track_results:
-            detail += "\n\n── 昨日选股 ──"
-            for r in track_results[:5]:
-                if r["change_pct"] is not None:
-                    arr = "+" if r["change_pct"] >= 0 else ""
-                    detail += f"\n{r['name']} {arr}{r['change_pct']:.1f}%"
-                else:
-                    detail += f"\n{r['name']} 数据失败"
+            if high_quality:
+                detail += "\n\n── 强信号 ──"
+                for r in high_quality[:3]:
+                    sym = r["code"].split(".")[1]
+                    detail += f"\n{r['name']}({sym}) {r['wyckoff_sig']} {r['wyckoff_score']}分"
 
-        # ── 持仓详情 ──
-        if last_trade:
-            t = last_trade
-            pnl_icon = "+" if t["pnl"] >= 0 else ""
-            detail += (
-                f"\n\n──── 持仓 ────\n"
-                f"{t['name']}({t['symbol']})\n"
-                f"现价: {t['price']:.2f} | 持仓: {t['shares']}股@{t['avg_price']:.2f}\n"
-                f"盈亏: {pnl_icon}{t['pnl']:.0f}({pnl_icon}{t['pnl_pct']:.1f}%)\n"
-                f"仓位: {t['ratio_pct']:.0f}% | 止损: {t['stop_price']:.2f}\n"
-                f"止盈: {t['exit_prices']} | 支撑: {t['supports']}\n"
-                f"威科夫: {t['phase']} | 趋势: {t['trend']}\n"
-                f"信号: {t['signal']}\n"
-            )
-            if t.get("score") is not None:
-                detail += f"评分: {t['score']}/100 {t['score_action']}\n"
-            detail += (
-                f"\n── 交易计划 ──\n"
-                f"操作: {t['action']}"
-            )
-            if t["add_shares"] > 0:
-                detail += f"\n加仓: {t['add_shares']}股 (总计{t['total_shares']}股, 均价{t['avg_price']:.2f}→{(t['avg_price']*t['shares']+t['price']*t['add_shares'])/(t['shares']+t['add_shares']):.2f})"
-            detail += f"\n止损线: {t['stop_price']:.2f} (亏{t['stop_loss_amt']:.0f})\n止盈: {t['exit_prices']}"
+            if track_results:
+                detail += "\n\n── 昨日选股 ──"
+                for r in track_results[:5]:
+                    if r["change_pct"] is not None:
+                        arr = "+" if r["change_pct"] >= 0 else ""
+                        detail += f"\n{r['name']} {arr}{r['change_pct']:.1f}%"
+                    else:
+                        detail += f"\n{r['name']} 数据失败"
 
-        if pushplus_token:
-            send_pushplus(pushplus_token, f"A股交易分析 {today}", detail)
-        elif serverchan_key:
-            send_serverchan(serverchan_key, f"A股交易分析 {today}", detail)
-        elif webhook_url:
-            push_report(webhook_url, f"A股交易分析 {today}", detail)
+            if last_trade:
+                t = last_trade
+                pnl_icon = "+" if t["pnl"] >= 0 else ""
+                detail += (
+                    f"\n\n── 持仓 ──\n"
+                    f"{t['name']}({t['symbol']})\n"
+                    f"现价: {t['price']:.2f} | {t['shares']}股@{t['avg_price']:.2f}\n"
+                    f"盈亏: {pnl_icon}{t['pnl']:.0f}({pnl_icon}{t['pnl_pct']:.1f}%)"
+                )
+
+            if pushplus_token:
+                send_pushplus(pushplus_token, f"A股交易分析 {today}", detail)
+            elif serverchan_key:
+                send_serverchan(serverchan_key, f"A股交易分析 {today}", detail)
+            elif webhook_url:
+                push_report(webhook_url, f"A股交易分析 {today}", detail)
 
 
 if __name__ == "__main__":

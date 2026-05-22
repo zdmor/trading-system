@@ -212,6 +212,37 @@ class MarketAnalyzer:
 
     # ───────────────────────────── 大盘健康度 ─────────────────────────────
 
+    @staticmethod
+    def get_pe_percentile():
+        """获取上证PE分位和总仓位上限"""
+        try:
+            import tushare as ts
+            pro = ts.pro_api()
+            df = pro.index_dailybasic(ts_code='000001.SH', start_date='20210522',
+                                      end_date='20260522', fields='trade_date,pe_ttm')
+            if df is None or len(df) < 10:
+                return {}, 1.0
+            pe = df['pe_ttm'].dropna().values.astype(float)
+            current_pe = pe[-1]
+            pct = (pe < current_pe).sum() / len(pe) * 100
+            # 全市场PE分位 → 总仓位上限
+            if pct < 30:
+                cap = 1.0
+                level = "低估"
+            elif pct < 60:
+                cap = 0.7
+                level = "适中"
+            elif pct < 90:
+                cap = 0.5
+                level = "偏高"
+            else:
+                cap = 0.35
+                level = "高估"
+            return {"pe": round(current_pe, 2), "percentile": round(pct, 1),
+                    "level": level, "cap": cap}, cap
+        except Exception:
+            return {}, 1.0
+
     # ───────────────────────────── 宏观数据（AKShare整合） ─────────────────────────────
 
     @staticmethod

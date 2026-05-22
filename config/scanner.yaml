@@ -1,0 +1,75 @@
+# 扫描器运行时配置
+# ============================================================
+
+# API 地址
+api:
+  sina_hq: "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
+  tencent_kline: "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,350,qfq"
+
+# 数据获取
+fetch:
+  max_pages: 80         # 新浪行情翻页数
+  page_size: 100        # 每页股票数
+  thread_pool: 15       # 并发线程数
+  request_timeout: 20   # HTTP 超时（秒）
+
+# 流动性过滤
+filter:
+  min_amount: 500000000  # 最低成交额（默认5亿）
+  # 可通过命令行参数覆盖
+
+# 分析
+analysis:
+  max_stocks: 80        # 最多分析多少只
+  stock_interval: 0.02  # 个股分析间隔（秒，防限流）
+  financial_batch_size: 10    # 基本面补充批次大小
+  financial_interval: 0.3     # 基本面请求间隔（秒，防限流）
+  quality_batch_size: 30      # 个股质地检查（第三层过滤）最大数量
+
+# 板块景气度五维评分
+sector_heat:
+  enabled: true
+  cache_ttl_minutes: 60
+  dimensions:
+    policy_weight: 0.15
+    capital_flow_weight: 0.25
+    strength_weight: 0.25
+    valuation_weight: 0.15
+    technical_weight: 0.20
+
+# 仓位决策矩阵
+position_matrix:
+  enabled: true
+  thresholds:
+    market_bull: 65
+    market_bear: 35
+    sector_strong: 70
+    sector_weak: 35
+
+# 深度研究个股
+research_tracker:
+  enabled: true
+  score_bonus: 10
+  display_marker: "R"
+
+# 行业分类
+industry:
+  cache_file: "industry_cache.json"
+  use_akshare: true
+
+# 输出
+report:
+  top_n_default: 15
+
+# 推送通知
+notify:
+  pushplus_token: ""
+  serverchan_key: ""
+  webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/80bc88c5-263c-4155-8907-e68d58d293f6"
+  # 三选一（优先顺序: pushplus > serverchan > webhook）:
+  #   pushplus_token: 推送到微信（推荐，最简单）
+  #     获取: https://www.pushplus.plus 微信扫码 -> 复制 token
+  #   serverchan_key: ServerChan 微信推送（备选）
+  #     获取: https://sct.ftqq.com 微信扫码 -> SendKey
+  #   webhook_url: 推送到飞书群
+  #     获取: 飞书群 -> 设置 -> 群机器人 -> Webhook机器人

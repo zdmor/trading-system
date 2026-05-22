@@ -23,7 +23,7 @@ import requests
 import warnings
 warnings.filterwarnings("ignore")
 
-from data_providers import AkshareProvider
+from data_providers import get_financial_indicators, get_stock_moneyflow
 
 
 # ============================================================
@@ -262,7 +262,7 @@ class Strategy:
             "upper_band": round(self.price + self.latest["atr"] * 2, 2),
         }
 
-    def position_plan(self, stop_price, risk_pct=0.02, entry_status=None, market_health=None, composite_score=None):
+    def position_plan(self, stop_price, risk_pct=0.02, entry_status=None, market_health=None, composite_score=None, pe_cap=None, sector_heat_score=None):
         """生成加仓/建仓计划
 
         Args:
@@ -271,14 +271,29 @@ class Strategy:
             entry_status: 入场信号状态，None/未知/观望 时不建议加仓
             market_health: 大盘健康度，较差时强行禁止加仓
             composite_score: 多因子综合评分，None时不调整
+            pe_cap: 全市场PE分位对应的总仓位上限(0-1)
+            sector_heat_score: 板块景气度评分(0-100)，用于仓位决策矩阵
         """
         # 入场信号弱时禁止加仓/建仓
         signal_blocked = entry_status in (None, "", "未知", "观望", "禁止开仓")
 
-        # 大盘环境极差时强行禁止（系统性风险硬限制）
-        if market_health and "较差" in market_health:
-            risk_pct = 0
-            signal_blocked = True
+        # PE分位上限（宏观水位线 → 总仓位硬顶）
+        pe_mult = pe_cap if (pe_cap is not None and pe_cap > 0) else 1.0
+
+        # 大盘健康度 → 仓位系数映射表
+        health_mult = 1.0
+        if market_health:
+            if "健康" in market_health:
+                health_mult = 1.0
+            elif "较好" in market_health:
+                health_mult = 0.75
+            elif "一般" in market_health:
+                health_mult = 0.50
+            elif "偏弱" in market_health:
+                health_mult = 0.25
+            elif "较差" in market_health:
+                risk_pct = 0
+                signal_blocked = True
 
         # 贝叶斯仓位系数：分数→概率连续映射 + 历史校准
         if composite_score is not None and not signal_blocked:
@@ -310,7 +325,21 @@ class Strategy:
                 base_mult = base_mult * calib_factor
                 base_mult = max(0.0, min(1.0, base_mult))
 
-            risk_pct = risk_pct * base_mult
+            # 仓位决策矩阵（可选）：综合大盘评分和板块热度
+            if sector_heat_score is not None and composite_score is not None:
+                try:
+                    from position_matrix import get_position_factor
+                    matrix_factor = get_position_factor(composite_score, sector_heat_score)
+                    # 矩阵结果与 base_mult 取平均
+                    if matrix_factor >= 0 and base_mult > 0:
+                        base_mult = (base_mult + matrix_factor) / 2
+                    elif matrix_factor >= 0:
+                        base_mult = matrix_factor
+                    base_mult = max(0.0, min(1.0, base_mult))
+                except Exception:
+                    pass
+
+            risk_pct = risk_pct * base_mult * health_mult * pe_mult
             if risk_pct <= 0:
                 signal_blocked = True
 
@@ -862,7 +891,10 @@ def main():
 
         # 止损位：ATR动态距离（替代固定比例）
         atr_val = daily["atr"].iloc[-1] if "atr" in daily.columns else price * 0.02
-        stop_price = round(price - atr_val * 1.5, 2) if atr_val > 0 else round(price * 0.93, 2)
+        stop_price = round(price - atr_val * 3.0, 2) if atr_val > 0 else round(price * 0.93, 2)
+
+        # 止盈位：ATR 5.0x 目标 + 阻力位辅助
+        atr_target_exit = round(price + atr_val * 5.0, 2) if atr_val > 0 else round(price * 1.15, 2)
 
         # 配置覆盖（如果config.json中有设定，优先使用）
         if "stop_price" in config:
@@ -870,15 +902,16 @@ def main():
         if "exit_prices" in config:
             exit_prices = config["exit_prices"]
         else:
-            exit_prices = [r for r in resistances] if resistances else [round(price * 1.08, 2)]
+            # ATR目标优先，阻力位辅
+            exit_prices = [atr_target_exit] + ([r for r in resistances[:2]] if resistances else [])
         if "supports" in config:
             levels["supports"] = config["supports"]
         if "resistances" in config:
             levels["resistances"] = config["resistances"]
 
-        # AKShare 基本面 & 资金流（技能整合）
-        fin_metrics = AkshareProvider.get_financial_indicators(symbol)
-        moneyflow = AkshareProvider.get_stock_moneyflow(symbol)
+        # 基本面 & 资金流（Tushare 优先）
+        fin_metrics = get_financial_indicators(symbol)
+        moneyflow = get_stock_moneyflow(symbol)
 
         # 多因子评分
         scoring_result = None

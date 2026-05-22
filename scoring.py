@@ -6,6 +6,27 @@ import numpy as np
 import pandas as pd
 from data_providers import AkshareProvider
 
+# 可选依赖: 板块景气度五维评分
+try:
+    from sector_heat import analyze as sector_heat_analyze
+    _SECTOR_HEAT_OK = True
+except ImportError:
+    _SECTOR_HEAT_OK = False
+
+# 可选依赖: 仓位决策矩阵
+try:
+    from position_matrix import get_position_factor
+    _POSITION_MATRIX_OK = True
+except ImportError:
+    _POSITION_MATRIX_OK = False
+
+# 可选依赖: 深度研究个股
+try:
+    from research_watchlist import ResearchTracker
+    _RESEARCH_TRACKER_OK = True
+except ImportError:
+    _RESEARCH_TRACKER_OK = False
+
 
 # 因子权重
 WEIGHTS = {
@@ -423,10 +444,33 @@ class StockScorer:
             base = 20
 
         final = max(0, min(100, base))
+
+        # 板块景气度五维增强（可选）
+        heat_score = None
+        if _SECTOR_HEAT_OK:
+            try:
+                heat = sector_heat_analyze(industry)
+                if heat and heat.get("composite"):
+                    heat_score = heat["composite"]
+            except Exception:
+                pass
+
+        if heat_score is not None:
+            blended = round(final * 0.6 + heat_score * 0.4)
+            detail_extra = f" 景气{heat_score} {heat.get('level','')}"
+            return {
+                "score": blended, "label": self._label(blended),
+                "detail": f"{industry} {change:+.2f}% 排名{target['rank']}/{target['total']}{detail_extra}",
+                "rank_pct": round(rank_pct, 1),
+                "heat_score": heat_score,
+                "heat_level": heat.get("level", ""),
+            }
+
         return {
             "score": final, "label": self._label(final),
             "detail": f"{industry} {change:+.2f}% 排名{target['rank']}/{target['total']}",
             "rank_pct": round(rank_pct, 1),
+        }
             "change_pct": change,
         }
 
@@ -670,7 +714,78 @@ class StockScorer:
             })
 
         composite = round(composite, 1)
+
+        # 深度研究个股加分（可选）
+        research_bonus = 0
+        if _RESEARCH_TRACKER_OK and self.symbol:
+            try:
+                research_bonus = ResearchTracker.get_score_bonus(self.symbol)
+                if research_bonus:
+                    bonus_factor = next((f for f in breakdown_lines if f["key"] == "wyckoff"), None)
+                    if bonus_factor:
+                        composite += research_bonus
+                        breakdown_lines.append({
+                            "key": "research_bonus", "weight": 0, "score": research_bonus,
+                            "contribution": research_bonus, "label": "研",
+                            "detail": f"深度研究确认 +{research_bonus}",
+                            "weight_pct": 0,
+                        })
+            except Exception:
+                pass
+
+        # ── 全局惩罚：短期涨幅过大 → 直接扣综合分 ──
+        try:
+            closes_arr = self.df["close"].values.astype(float)
+            if len(closes_arr) >= 21:
+                ret_20d = (closes_arr[-1] / closes_arr[-21] - 1) * 100
+                if ret_20d > 30:
+                    penalty = min(25, int((ret_20d - 30) * 0.6))
+                    composite -= penalty
+                    breakdown_lines.append({
+                        "key": "runup_penalty", "weight": 0, "score": -penalty,
+                        "contribution": -penalty, "label": "罚",
+                        "detail": f"20日涨{ret_20d:.0f}% 追高惩罚 -{penalty}",
+                        "weight_pct": 0,
+                    })
+                elif ret_20d > 20:
+                    penalty = int((ret_20d - 20) * 0.3)
+                    composite -= penalty
+                    breakdown_lines.append({
+                        "key": "runup_penalty", "weight": 0, "score": -penalty,
+                        "contribution": -penalty, "label": "罚",
+                        "detail": f"20日涨{ret_20d:.0f}% 偏高惩罚 -{penalty}",
+                        "weight_pct": 0,
+                    })
+            if len(closes_arr) >= 61:
+                ret_60d = (closes_arr[-1] / closes_arr[-61] - 1) * 100
+                if ret_60d > 60 and len(closes_arr) < 21 or (len(closes_arr) >= 21 and not (ret_20d > 20)):
+                    penalty = min(15, int((ret_60d - 60) * 0.2))
+                    composite -= penalty
+                    breakdown_lines.append({
+                        "key": "runup_penalty", "weight": 0, "score": -penalty,
+                        "contribution": -penalty, "label": "罚",
+                        "detail": f"60日涨{ret_60d:.0f}% 累计涨幅大 -{penalty}",
+                        "weight_pct": 0,
+                    })
+        except Exception:
+            pass
+
         action, pos_factor = score_to_level(composite)
+
+        # 仓位决策矩阵（可选）: 综合大盘评分和板块热度
+        if _POSITION_MATRIX_OK:
+            try:
+                market_score = factors.get("market", {}).get("score", 50)
+                sector_score = factors.get("sector", {}).get("heat_score", factors.get("sector", {}).get("score", 50))
+                matrix_factor = get_position_factor(market_score, sector_score)
+                # 矩阵结果与原始pos_factor取平均，既保留分数映射，又引入大盘×板块约束
+                if matrix_factor >= 0 and pos_factor >= 0:
+                    pos_factor = round((pos_factor + matrix_factor) / 2, 2)
+                elif matrix_factor >= 0:
+                    pos_factor = matrix_factor
+                pos_factor = max(0.0, min(1.0, pos_factor))
+            except Exception:
+                pass
 
         return {
             "composite_score": composite,
