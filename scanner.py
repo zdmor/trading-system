@@ -854,9 +854,9 @@ class Scanner:
     # ==================== 获取全市场数据 ====================
 
     @staticmethod
-    def _fetch_page(page, num=100, timeout=20):
+    def _fetch_page(page, num=100, timeout=20, node="hs_a"):
         params = {"page": page, "num": num, "sort": "symbol",
-                  "asc": "1", "node": "hs_a", "_s_r_a": "init"}
+                  "asc": "1", "node": node, "_s_r_a": "init"}
         r = requests.get(Scanner.SINA_HQ_URL, params=params, timeout=timeout)
         return r.json()
 
@@ -867,14 +867,20 @@ class Scanner:
         workers = fc.get("thread_pool", 15)
         timeout = fc.get("request_timeout", 20)
         all_data = []
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(self._fetch_page, p, page_size, timeout): p for p in range(1, max_pages + 1)}
-            for f in as_completed(futures):
-                try:
-                    data = f.result()
-                    if data:
-                        all_data.extend(data)
-                except Exception: pass
+        # 同时获取沪市(sh_a)和深市(sz_a)，hs_a已改为仅北交所
+        for node in ("sh_a", "sz_a"):
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                pages_per_exchange = max(30, max_pages // 2)
+                futures = {}
+                for p in range(1, pages_per_exchange + 1):
+                    futures[pool.submit(self._fetch_page, p, page_size, timeout, node)] = p
+                for f in as_completed(futures):
+                    try:
+                        data = f.result()
+                        if data:
+                            all_data.extend(data)
+                    except Exception:
+                        pass
 
         stocks, snapshot = [], {}
         if all_data:
