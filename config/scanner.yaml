@@ -57,6 +57,24 @@ industry:
   cache_file: "industry_cache.json"
   use_akshare: true
 
+# 自选股池（四层漏斗第二/三层结果 + 持仓）
+watchlist:
+  pool:                     # 关注池
+    - code: "600309"        # 万华化学 — 多头吸筹期，评分51.7
+    - code: "000651"        # 格力电器 — 空头回避
+    - code: "600415"        # 小商品城 — 空头回避
+    - code: "002714"        # 牧原股份 — 空头回避
+  holdings:                 # 持仓
+    - code: "002050"        # 三花智控 成本51.44×100 多头筑底
+      cost: 51.44
+      shares: 100
+    - code: "600038"        # 中直股份 成本35.37×300 浮亏19%
+      cost: 35.37
+      shares: 300
+    - code: "600416"        # 湘电股份 成本13.29×400 浮亏11%
+      cost: 13.29
+      shares: 400
+
 # 输出
 report:
   top_n_default: 15

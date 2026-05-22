@@ -1122,6 +1122,50 @@ class Scanner:
         self.results = results
         return results
 
+    # ==================== 持仓/股票池分析 ====================
+
+    def analyze_watchlist(self):
+        """分析自选股池 + 持仓个股状态"""
+        wl = self._sc.get("watchlist", {})
+        pool = wl.get("pool", [])
+        holdings = wl.get("holdings", [])
+        watchlist_results = {"pool": [], "holdings": []}
+
+        # 分析关注池
+        for item in pool:
+            code = item["code"]
+            bs_code = f"sh.{code}" if code.startswith("6") else f"sz.{code}"
+            snap = self.snapshot.get(bs_code, {})
+            name = snap.get("name", code)
+            analysis = self._analyze_stock(bs_code)
+            analysis["code"] = code
+            analysis["name"] = name
+            analysis["price"] = snap.get("price", 0)
+            watchlist_results["pool"].append(analysis)
+            time.sleep(0.02)
+
+        # 分析持仓
+        for item in holdings:
+            code = item["code"]
+            bs_code = f"sh.{code}" if code.startswith("6") else f"sz.{code}"
+            snap = self.snapshot.get(bs_code, {})
+            name = snap.get("name", code)
+            analysis = self._analyze_stock(bs_code)
+            analysis["code"] = code
+            analysis["name"] = name
+            analysis["price"] = snap.get("price", 0)
+            analysis["cost"] = item.get("cost", 0)
+            analysis["shares"] = item.get("shares", 0)
+            if analysis["cost"] > 0 and analysis["price"] > 0:
+                analysis["pnl_pct"] = round((analysis["price"] / analysis["cost"] - 1) * 100, 1)
+            else:
+                analysis["pnl_pct"] = None
+            watchlist_results["holdings"].append(analysis)
+            time.sleep(0.02)
+
+        self.watchlist_results = watchlist_results
+        return watchlist_results
+
     # ==================== 报告 ====================
 
     def _get_concept_board_performance(self):
@@ -1165,6 +1209,20 @@ class Scanner:
             print("  无符合条件标的")
             return
 
+        # === 大盘概况 ===
+        try:
+            from market import MarketAnalyzer
+            indices = MarketAnalyzer.fetch_indices()
+            if indices:
+                print(f"  【大盘概况】")
+                for key in ["sh000001", "sz399001", "sz399006", "sh000688"]:
+                    idx = indices.get(key)
+                    if idx:
+                        arrow = "+" if idx["change_pct"] >= 0 else ""
+                        print(f"  {idx['name']:<8} {idx['price']:<10.2f}  {arrow}{idx['change_pct']:+.2f}%")
+        except Exception:
+            pass
+
         # === 板块分布 ===
         sectors = {}
         for r in self.results:
@@ -1198,6 +1256,51 @@ class Scanner:
                     pass
 
         print()
+
+        # === 股票池状态 ===
+        if hasattr(self, "watchlist_results"):
+            pool = self.watchlist_results.get("pool", [])
+            if pool:
+                print(f"  【股票池状态】")
+                print(f"  {'代码':<8} {'名称':<10} {'趋势':<10} {'威科夫':<18} {'阶段':<14} {'价格':<8}")
+                print(f"  " + "-" * 72)
+                for s in pool:
+                    sym = s["code"]
+                    nn = s["name"][:8]
+                    tr = f"{s['trend']}({s['strength']:+.1f}%)" if s["trend"] in ("多头", "空头") else s["trend"]
+                    sg = f"{s['wyckoff_sig']}({s['wyckoff_score']})" if s["wyckoff_sig"] not in ("-", "无信号") else "-"
+                    ph = s.get("phase", "")[:12]
+                    pr = f"{s['price']:.2f}" if s["price"] else "-"
+                    print(f"  {sym:<8} {nn:<10} {tr:<10} {sg:<18} {ph:<14} {pr:<8}")
+                print()
+
+        # === 持仓状态和建议 ===
+        if hasattr(self, "watchlist_results"):
+            holdings = self.watchlist_results.get("holdings", [])
+            if holdings:
+                print(f"  【持仓状态和建议】")
+                print(f"  {'代码':<8} {'名称':<8} {'趋势':<8} {'威科夫':<16} {'价格':<8} {'成本':<8} {'浮盈':<8} {'建议':<12}")
+                print(f"  " + "-" * 80)
+                for s in holdings:
+                    sym = s["code"]
+                    nn = s["name"][:6]
+                    tr = f"{s['trend']}({s['strength']:+.1f}%)" if s["trend"] in ("多头", "空头") else s["trend"]
+                    sg = f"{s['wyckoff_sig']}({s['wyckoff_score']})" if s["wyckoff_sig"] not in ("-", "无信号") else "-"
+                    pr = f"{s['price']:.2f}" if s["price"] else "-"
+                    cost = f"{s['cost']:.2f}" if s.get("cost") else "-"
+                    pnl = f"{s['pnl_pct']:+.1f}%" if s.get("pnl_pct") is not None else "-"
+                    # 建议规则
+                    sug = "持有"
+                    if s["trend"] == "空头":
+                        sug = "减仓/止损"
+                    elif s["wyckoff_sig"] in ("Upthrust",) and s.get("pnl_pct", 0) is not None and s["pnl_pct"] > 5:
+                        sug = "减仓"
+                    elif s["wyckoff_sig"] in ("Spring", "SOS", "LPS"):
+                        sug = "加仓/持有"
+                    elif s.get("pnl_pct") is not None and s["pnl_pct"] < -15:
+                        sug = "警惕止损"
+                    print(f"  {sym:<8} {nn:<8} {tr:<8} {sg:<16} {pr:<8} {cost:<8} {pnl:<8} {sug:<12}")
+                print()
 
         # === Top N ===
         print(f"  [Top {top_n}]")
@@ -1321,6 +1424,10 @@ class Scanner:
             # [3.5/3] 个股质地检查（第三层，仅标记不过滤）
             print("[3.5/3] 个股质地检查 (Tushare)...")
             self.enrich_with_quality(self.results)
+
+            # [4/4] 持仓/股票池分析
+            print("[4/4] 持仓+股票池分析...")
+            self.analyze_watchlist()
 
         self.print_report(top_n)
 

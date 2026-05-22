@@ -1,0 +1,64 @@
+{
+  "stocks": [
+    {
+      "code": "600183",
+      "name": "生益科技",
+      "date_added": "2026-05-22",
+      "reason": "市值风云: AI算力CCL全球第二, 毛利率23.9%",
+      "conviction": "high",
+      "bypass_roe": false,
+      "bypass_revenue": false,
+      "active": true
+    },
+    {
+      "code": "688183",
+      "name": "生益电子",
+      "date_added": "2026-05-22",
+      "reason": "市值风云: AI PCB放量, 毛利率22.7%->35.2%",
+      "conviction": "high",
+      "bypass_roe": false,
+      "bypass_revenue": false,
+      "active": true
+    },
+    {
+      "code": "600150",
+      "name": "中国船舶",
+      "date_added": "2026-05-22",
+      "reason": "市值风云: 全球最大上市造船企业, 在手订单+45.6%",
+      "conviction": "high",
+      "bypass_roe": false,
+      "bypass_revenue": false,
+      "active": true
+    },
+    {
+      "code": "000725",
+      "name": "京东方A",
+      "date_added": "2026-05-22",
+      "reason": "市值风云: 联手康宁卡位英伟达, Micro-LED+玻璃基板",
+      "conviction": "high",
+      "bypass_roe": false,
+      "bypass_revenue": false,
+      "active": true
+    },
+    {
+      "code": "000100",
+      "name": "TCL科技",
+      "date_added": "2026-05-22",
+      "reason": "市值风云: 面板+硅片双驱动, Q1利润15.6亿创新高",
+      "conviction": "high",
+      "bypass_roe": false,
+      "bypass_revenue": false,
+      "active": true
+    },
+    {
+      "code": "002064",
+      "name": "华峰化学",
+      "date_added": "2026-05-22",
+      "reason": "市值风云: 氨纶龙头周期反转, Q1利润+32.6%",
+      "conviction": "medium",
+      "bypass_roe": false,
+      "bypass_revenue": false,
+      "active": true
+    }
+  ]
+}
