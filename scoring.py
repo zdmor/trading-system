@@ -62,6 +62,10 @@ try:
 except ImportError:
     _DEBATE_OK = False
 
+# 板块数据缓存（跨股票共享，避免重复抓取）
+_SECTOR_BOARD_CACHE = {'data': [], 'time': 0.0}
+_SECTOR_CACHE_TTL = 3600
+
 WEIGHTS = {
     "tech_strength": 0.28,       # 威科夫+趋势动量合并 (原20+15=35→折合28，消除共线冗余)
     "risk_reward": 0.18,         # 盈亏比 (16→18)
@@ -538,13 +542,33 @@ class StockScorer:
                         "detail": f"行业默认分{self.default_sector_score}", "rank_pct": 50}
             return {"score": 50, "label": "中", "detail": "行业未知", "rank_pct": 50}
 
-        # 获取行业板块涨跌幅排行
-        try:
-            boards = AkshareProvider.get_industry_board_performance()
-        except Exception:
-            boards = []
+        # 获取行业板块涨跌幅排行（带缓存）
+        import time as _time
+        boards = []
+        now = _time.time()
+        if now - _SECTOR_BOARD_CACHE["time"] < _SECTOR_CACHE_TTL:
+            boards = _SECTOR_BOARD_CACHE["data"]
+        else:
+            try:
+                boards = AkshareProvider.get_industry_board_performance()
+                if boards:
+                    _SECTOR_BOARD_CACHE["data"] = boards
+                    _SECTOR_BOARD_CACHE["time"] = now
+            except Exception:
+                boards = _SECTOR_BOARD_CACHE["data"] if _SECTOR_BOARD_CACHE["data"] else []
 
         if not boards:
+            # 板块排行数据不可用 → 尝试五维景气度评分
+            if _SECTOR_HEAT_OK:
+                try:
+                    heat = sector_heat_analyze(industry)
+                    if heat and heat.get("composite"):
+                        hs = heat["composite"]
+                        return {"score": hs, "label": self._label(hs),
+                                "detail": f"{industry} 景气{hs} {heat.get('level','')}",
+                                "rank_pct": 50, "heat_score": hs, "heat_level": heat.get("level", "")}
+                except Exception:
+                    pass
             if self.default_sector_score is not None:
                 return {"score": self.default_sector_score, "label": self._label(self.default_sector_score),
                         "detail": f"{industry} (板块数据无,默认{self.default_sector_score})", "rank_pct": 50}
