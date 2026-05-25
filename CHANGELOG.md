@@ -1,0 +1,50 @@
+# CHANGELOG
+
+> 与 D:\DiskMigration\MySecondBrain\references\CHANGELOG.md 同步
+> 每次 git commit + tag 后更新
+
+---
+
+## v1.3.0-debate (2026-05-25)
+- 新增: 多因子多空辩论模块 bull_bear_debate.py
+- 新增: 因子分歧度指标（std/mean，拥挤预警信号）
+- 修改: scoring.py 集成辩论裁决，否决时强制降仓位
+- 修改: scoring.py 集成动态权重（ICIR调整），替代固定 WEIGHTS
+
+## v1.2.0-fundamental (2026-05-25)
+- 新增: 基本面分析系统 fundamental_analyzer.py
+- 新增: 市值风云种子池 32 只股票
+- 新增: fundamental_pool.json 持久化 PASS/FAIL/WATCH 评级
+- 新增: 导出 Markdown 报告到 vault
+
+## v1.1.0-weights (2026-05-25)
+- 新增: 动态因子权重系统 factor_weights.py
+- 新增: 基于 ICIR 的权重自动调整
+- 新增: factor_ic_cache.json 持久化
+- 修改: factor_ic_rolling.py 运行后自动写入 IC 缓存
+- 修复: tushare_provider.py config.json 编码问题（指定 utf-8 打开）
+
+## v1.0.0-p1 (2026-05-25)
+- 重构: 8 因子→6 因子（wyckoff+动量合并为 tech_strength, 大盘移出权重）
+- 新增: Kelly 仓位模块 kelly_position.py
+- 新增: 仓位决策矩阵 position_matrix.py
+- 修改: scoring.py WEIGHTS 更新为 6 因子架构
+- 修改: volume_momentum.py 百分位量比替换绝对阈值（P0遗留）
+
+## v0.3.0-volume (2026-05-24)
+- 新增: 量比动量系统 volume_momentum.py
+- 新增: vol_mom_scan.py 全市场量比扫描
+- 新增: 百分位量比归一化（120日历史窗口）
+- 删除: 追高惩罚模块（P0-1 证明 A 股有动量效应，惩罚有害）
+
+## v0.2.0-scanner (2026-05)
+- 新增: 全市场扫描选股 scanner.py
+- 新增: 舆情监控 buzz_monitor.py
+- 新增: 龙虎榜席位分析 lhb_analyzer.py
+- 新增: 情绪 3sigma 过热检测 sentiment_indicator.py
+
+## v0.1.0-wyckoff (2025)
+- 新增: 威科夫形态检测引擎 v2.2
+- 新增: 多因子评分系统 scoring.py（8 因子初版）
+- 新增: 回测系统 backtest.py
+- 新增: 推送模块（飞书通知）
