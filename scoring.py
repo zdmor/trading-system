@@ -46,13 +46,6 @@ try:
     _VOL_MOMENTUM = True
 except ImportError:
     _VOL_MOMENTUM = False
-
-try:
-    from factor_weights import get_weights as _get_dynamic_weights
-    _DYNAMIC_WEIGHTS_OK = True
-except ImportError:
-    _DYNAMIC_WEIGHTS_OK = False
-
 WEIGHTS = {
     "tech_strength": 0.28,       # 威科夫+趋势动量合并 (原20+15=35→折合28，消除共线冗余)
     "risk_reward": 0.18,         # 盈亏比 (16→18)
@@ -272,7 +265,7 @@ class StockScorer:
     # ─────────────────────── 因子3: 量能分析（量比动量系统） ───────────────────────
 
     def score_volume(self):
-        """量比动量评分 (权重15%)
+        """量比动量评分 (权重9%)
         基于 VolumeMomentum 的量比均线+斜率+综合评分
         """
         try:
@@ -786,11 +779,10 @@ class StockScorer:
         except Exception:
             factors["market"] = {"score": 50, "label": "中", "detail": "计算异常"}
 
-        # 加权综合（动态权重：ICIR调整，无IC数据时回退固定权重）
-        _weights = _get_dynamic_weights() if _DYNAMIC_WEIGHTS_OK else WEIGHTS
+        # 加权综合
         composite = 0.0
         breakdown_lines = []
-        for key, weight in _weights.items():
+        for key, weight in WEIGHTS.items():
             f = factors[key]
             contribution = f["score"] * weight
             composite += contribution
@@ -812,7 +804,7 @@ class StockScorer:
             try:
                 research_bonus = ResearchTracker.get_score_bonus(self.symbol)
                 if research_bonus:
-                    bonus_factor = next((f for f in breakdown_lines if f["key"] == "tech_strength"), None)
+                    bonus_factor = next((f for f in breakdown_lines if f["key"] == "wyckoff"), None)
                     if bonus_factor:
                         composite += research_bonus
                         breakdown_lines.append({
@@ -855,18 +847,6 @@ class StockScorer:
             except Exception:
                 pass
 
-        # 多空辩论（补充决策参考，不覆盖composite_score）
-        debate_result = {}
-        try:
-            from bull_bear_debate import debate_factors
-            debate_result = debate_factors(breakdown_lines, composite)
-            if debate_result.get("veto_triggered"):
-                pos_factor = min(pos_factor, 0.3)
-            elif debate_result.get("verdict") == "争议":
-                pos_factor = min(pos_factor, 0.5)
-        except Exception:
-            pass
-
         return {
             "composite_score": composite,
             "action": action,
@@ -874,4 +854,6 @@ class StockScorer:
             "factors": breakdown_lines,
             "level": self._label(composite),
             "kelly_detail": kelly_detail,
+            "stop_price": self.stop_price,
+            "stop_pct": round((self.price - self.stop_price) / self.price * 100, 1),
         }
