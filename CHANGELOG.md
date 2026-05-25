@@ -5,6 +5,21 @@
 
 ---
 
+## v1.5.0-icbridge (2026-05-25)
+- 新增: p1_8_ic_backtest.py 全因子IC回测（新6因子 + 市态分组）
+- 新增: IC缓存桥接 — p1_8_ic_backtest.py 自动写入 factor_ic_cache.json
+- 运行: 41截面 IC 回测，动态权重系统已激活
+
+---
+
+## v1.4.0-tepper (2026-05-25)
+- 新增: R/R 直连 Kelly b 参数（score_risk_reward 实际赔率替代统计值）
+- 新增: 情绪放大器（恐慌<30 仓位×1.5，贪婪>75 减半）
+- 新增: compute() 返回 stop_price + stop_pct 止损信息
+- 新增: TEPPER_PLAN.md 泰珀方法论映射文档
+
+---
+
 ## v1.3.0-debate (2026-05-25)
 - 新增: 多因子多空辩论模块 bull_bear_debate.py
 - 新增: 因子分歧度指标（std/mean，拥挤预警信号）
