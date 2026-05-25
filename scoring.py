@@ -855,6 +855,18 @@ class StockScorer:
             except Exception:
                 pass
 
+        # 多空辩论（补充决策参考，不覆盖composite_score）
+        debate_result = {}
+        try:
+            from bull_bear_debate import debate_factors
+            debate_result = debate_factors(breakdown_lines, composite)
+            if debate_result.get("veto_triggered"):
+                pos_factor = min(pos_factor, 0.3)
+            elif debate_result.get("verdict") == "争议":
+                pos_factor = min(pos_factor, 0.5)
+        except Exception:
+            pass
+
         return {
             "composite_score": composite,
             "action": action,
