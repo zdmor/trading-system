@@ -16,17 +16,21 @@ from datetime import datetime, timedelta
 from typing import Optional
 from collections import defaultdict
 
-# 基础权重（P1-4 六因子架构，合计 1.0）
+# 基础权重（基于 68 截面 IC 回测，合计 1.0）
+# IC 正值越高权重越大，负 IC 因子保留低权重用于市态切换
+# risk_reward 唯一全周期正 IC (+0.0636)，权重最高
+# tech_strength/relative_strength 牛市有效，保留中等权重
+# volume/candlestick 全周期负 IC，保留低权重
 BASE_WEIGHTS = {
-    "tech_strength": 0.33,
-    "risk_reward": 0.22,
-    "volume": 0.18,
-    "candlestick": 0.05,
-    "relative_strength": 0.22,
+    "risk_reward": 0.40,
+    "tech_strength": 0.20,
+    "relative_strength": 0.15,
+    "volume": 0.13,
+    "candlestick": 0.12,
 }
 
 # 调节参数
-K = 0.3           # ICIR 影响强度（0=完全固定，0.5=最大调整幅度~±15%）
+K = 0.5           # ICIR 影响强度（0=完全固定，0.5=最大调整幅度~±25%）
 MIN_WEIGHT = 0.02  # 单因子最小权重
 MAX_MULTIPLIER = 2.0  # 单因子最大为基础权重的倍数
 

@@ -1,11 +1,11 @@
 {
   "tech_strength": {
-    "win_rate": 0.56,
+    "win_rate": 0.54,
     "avg_win": 3.2,
     "avg_loss": 2.8
   },
   "risk_reward": {
-    "win_rate": 0.39,
+    "win_rate": 0.62,
     "avg_win": 3.5,
     "avg_loss": 3.5
   },
@@ -15,17 +15,17 @@
     "avg_loss": 3.2
   },
   "candlestick": {
-    "win_rate": 0.51,
+    "win_rate": 0.40,
     "avg_win": 2.5,
     "avg_loss": 2.5
   },
   "sector": {
-    "win_rate": 0.5,
+    "win_rate": 0.50,
     "avg_win": 2.8,
     "avg_loss": 2.8
   },
   "relative_strength": {
-    "win_rate": 0.51,
+    "win_rate": 0.43,
     "avg_win": 3.3,
     "avg_loss": 3.0
   }

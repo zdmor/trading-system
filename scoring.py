@@ -67,13 +67,13 @@ _SECTOR_BOARD_CACHE = {'data': [], 'time': 0.0}
 _SECTOR_CACHE_TTL = 3600
 
 WEIGHTS = {
-    "tech_strength": 0.33,       # 威科夫+趋势动量合并 (原28→33，吸收了sector的权重)
-    "risk_reward": 0.22,         # 盈亏比 (原18→22)
-    "volume": 0.18,              # 量比动量 (原15→18)
-    "candlestick": 0.05,         # K线形态 (不变)
-    "relative_strength": 0.22,   # 相对强度 (原18→22)
+    "risk_reward": 0.40,           # 盈亏比 — 唯一全周期正 IC (+0.0636, ICIR 0.33)
+    "tech_strength": 0.20,         # 威科夫+趋势动量 — 牛市有效，全周期负 IC (-0.0285)
+    "relative_strength": 0.15,     # 相对强度 — 牛市有效，全周期负 IC (-0.0537)
+    "volume": 0.13,                # 量比动量 — 全周期负 IC (-0.0373)
+    "candlestick": 0.12,           # K线形态 — 全周期负 IC (-0.0487)
 }
-# sector 因子从评分权重中移除（IC=-0.032 负预测能力），降级为仓位约束。
+# 权重基于 68 截面 IC 回测 (2026-05-26)。sector 因子从评分权重中移除（IC=-0.032），降级为仓位约束。
 # 大盘趋势不参与个股评分，在 position_matrix.py 做仓位门槛。
 
 # 评分 → 操作映射

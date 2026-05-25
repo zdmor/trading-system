@@ -22,12 +22,13 @@ import numpy as np
 # avg_win: 正收益均值 (%)
 # avg_loss: 负收益均值 (%) 的绝对值
 FACTOR_STATS = {
-    "tech_strength":   {"win_rate": 0.56, "avg_win": 3.2, "avg_loss": 2.8},
-    "risk_reward":     {"win_rate": 0.39, "avg_win": 3.5, "avg_loss": 3.5},
+    # 68 截面 IC 回测更新 (2026-05-26)
+    "tech_strength":   {"win_rate": 0.54, "avg_win": 3.2, "avg_loss": 2.8},
+    "risk_reward":     {"win_rate": 0.62, "avg_win": 3.5, "avg_loss": 3.5},  # 唯一正 IC 因子
     "volume":          {"win_rate": 0.41, "avg_win": 3.0, "avg_loss": 3.2},
-    "candlestick":     {"win_rate": 0.51, "avg_win": 2.5, "avg_loss": 2.5},
-    "sector":          {"win_rate": 0.50, "avg_win": 2.8, "avg_loss": 2.8},  # 移出评分权重，仅做仓位约束
-    "relative_strength": {"win_rate": 0.51, "avg_win": 3.3, "avg_loss": 3.0},
+    "candlestick":     {"win_rate": 0.40, "avg_win": 2.5, "avg_loss": 2.5},
+    "sector":          {"win_rate": 0.50, "avg_win": 2.8, "avg_loss": 2.8},  # 仓位约束，不参与评分权重
+    "relative_strength": {"win_rate": 0.43, "avg_win": 3.3, "avg_loss": 3.0},
 }
 
 # 文件持久化路径
