@@ -256,27 +256,53 @@ class StockScorer:
             except Exception:
                 pass
 
-        # 量比动量分析
-        vm = VolumeMomentum(list(volumes), regime=regime, closes=list(closes))
+        # 量比动量分析（传入历史量比序列用于百分位归一化）
+        # 构建最近120日量比序列（不含当日）作为历史参考
+        vol_history = None
+        if len(volumes) >= 21:
+            lookback = min(120, len(volumes) - 1)
+            hist_ratios = []
+            for i in range(len(volumes) - lookback, len(volumes)):
+                avg = np.mean(volumes[max(0, i-20):i]) if i >= 20 else np.mean(volumes[:max(1,i)])
+                hist_ratios.append(volumes[i] / avg if avg > 0 else 1.0)
+            vol_history = hist_ratios[-lookback:]
+
+        vm = VolumeMomentum(list(volumes), regime=regime, closes=list(closes),
+                           vol_history=vol_history)
         result = vm.analyze()
 
-        # 综合评分 → 0-100 映射
-        cs = result["composite_score"]
-        direction = result.get("direction", "正常")
-        if cs >= 3.5:
-            base = 85
-            if direction == "放量上涨":
-                base = 92
-            elif direction == "放量下跌":
-                base = 50
-        elif cs >= 2.0:
-            base = 65 + (cs - 2.0) / 1.5 * 15  # 65-80
-        elif cs >= 1.3:
-            base = 45 + (cs - 1.3) / 0.7 * 20  # 45-65
-        elif cs >= 0.5:
-            base = 30 + (cs - 0.5) * 15  # 30-45
+        # 百分制映射：优先百分位，回退绝对阈值
+        pct = result.get("percentile")
+        if pct is not None:
+            if pct >= 90:    base = 92
+            elif pct >= 75:  base = 80
+            elif pct >= 50:  base = 65
+            elif pct >= 25:  base = 45
+            else:            base = 20
+            # 放量上涨加成、放量下跌打折
+            direction = result.get("direction", "正常")
+            if direction == "放量上涨" and pct >= 75:
+                base = min(100, base + 8)
+            elif direction == "放量下跌" and pct >= 75:
+                base = max(0, base - 15)
         else:
-            base = 20
+            # 回退：绝对阈值
+            cs = result["composite_score"]
+            direction = result.get("direction", "正常")
+            if cs >= 3.5:
+                base = 85
+                if direction == "放量上涨":
+                    base = 92
+                elif direction == "放量下跌":
+                    base = 50
+            elif cs >= 2.0:
+                base = 65 + (cs - 2.0) / 1.5 * 15  # 65-80
+            elif cs >= 1.3:
+                base = 45 + (cs - 1.3) / 0.7 * 20  # 45-65
+            elif cs >= 0.5:
+                base = 30 + (cs - 0.5) * 15  # 30-45
+            else:
+                base = 20
 
         # 三重过滤调整
         checks_passed = result["checks_passed"]
@@ -310,12 +336,16 @@ class StockScorer:
         final = max(0, min(100, base))
         detail_parts = [
             f"量比{result['vol_ratio']:.1f}",
+        ]
+        if pct is not None:
+            detail_parts.append(f"百分位P{pct:.0f}")
+        detail_parts.extend([
             f"均线{result['vol_ratio_ma']:.1f}",
             f"斜率{result['slope']:.2f}",
             f"综合{result['composite_score']:.1f}",
             result['direction'],
             result['signal'],
-        ]
+        ])
 
         return {
             "score": final, "label": self._label(final),
@@ -751,43 +781,6 @@ class StockScorer:
                         })
             except Exception:
                 pass
-
-        # ── 全局惩罚：短期涨幅过大 → 直接扣综合分 ──
-        try:
-            closes_arr = self.df["close"].values.astype(float)
-            if len(closes_arr) >= 21:
-                ret_20d = (closes_arr[-1] / closes_arr[-21] - 1) * 100
-                if ret_20d > 30:
-                    penalty = min(25, int((ret_20d - 30) * 0.6))
-                    composite -= penalty
-                    breakdown_lines.append({
-                        "key": "runup_penalty", "weight": 0, "score": -penalty,
-                        "contribution": -penalty, "label": "罚",
-                        "detail": f"20日涨{ret_20d:.0f}% 追高惩罚 -{penalty}",
-                        "weight_pct": 0,
-                    })
-                elif ret_20d > 20:
-                    penalty = int((ret_20d - 20) * 0.3)
-                    composite -= penalty
-                    breakdown_lines.append({
-                        "key": "runup_penalty", "weight": 0, "score": -penalty,
-                        "contribution": -penalty, "label": "罚",
-                        "detail": f"20日涨{ret_20d:.0f}% 偏高惩罚 -{penalty}",
-                        "weight_pct": 0,
-                    })
-            if len(closes_arr) >= 61:
-                ret_60d = (closes_arr[-1] / closes_arr[-61] - 1) * 100
-                if ret_60d > 60 and len(closes_arr) < 21 or (len(closes_arr) >= 21 and not (ret_20d > 20)):
-                    penalty = min(15, int((ret_60d - 60) * 0.2))
-                    composite -= penalty
-                    breakdown_lines.append({
-                        "key": "runup_penalty", "weight": 0, "score": -penalty,
-                        "contribution": -penalty, "label": "罚",
-                        "detail": f"60日涨{ret_60d:.0f}% 累计涨幅大 -{penalty}",
-                        "weight_pct": 0,
-                    })
-        except Exception:
-            pass
 
         action, pos_factor = score_to_level(composite)
 

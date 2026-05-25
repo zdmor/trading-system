@@ -82,15 +82,29 @@ def fetch_kline_tencent(code, days=60):
         # kline format: ["2026-05-23", 5.10, 5.20, 5.05, 5.18, 12345678]
         closes, volumes = [], []
         for k in klines[-days:]:
-            closes.append(float(k[2]))  # close = idx 2
-            volumes.append(float(k[5]))  # volume = idx 5
+            closes.append(float(k[2]))
+            volumes.append(float(k[5]))
 
         return closes, volumes
     except Exception:
         return None, None
 
 
-def run_scan(top_n=200, regime="neutral", kline_days=50):
+def build_vol_history(volumes, lookback=120):
+    """从成交量序列构建量比历史序列（用于百分位归一化）"""
+    if len(volumes) < 22:
+        return None
+    hist_ratios = []
+    n = len(volumes)
+    start = max(0, n - lookback - 1)
+    for i in range(start, n - 1):
+        window_start = max(0, i - 20)
+        avg = np.mean(volumes[window_start:i]) if i > window_start else volumes[i]
+        hist_ratios.append(volumes[i] / avg if avg > 0 else 1.0)
+    return hist_ratios[-lookback:] if len(hist_ratios) > lookback else hist_ratios
+
+
+def run_scan(top_n=200, regime="neutral", kline_days=200):
     """扫描成交额前N只个股"""
     print(f"[1/3] 获取全市场行情 (新浪)...")
     stocks = fetch_spot_sina(top_n)
@@ -99,7 +113,7 @@ def run_scan(top_n=200, regime="neutral", kline_days=50):
         return []
     print(f"  取到 {len(stocks)} 只 (成交额排序)")
 
-    print(f"[2/3] 逐只获取K线 (腾讯) + 量比动量分析...")
+    print(f"[2/3] 逐只获取K线 (腾讯, {kline_days}天) + 量比动量分析...")
     results = []
     t0 = time.time()
     errors = 0
@@ -112,7 +126,9 @@ def run_scan(top_n=200, regime="neutral", kline_days=50):
                 errors += 1
                 continue
 
-            vm = VolumeMomentum(volumes, regime=regime, closes=closes)
+            vol_history = build_vol_history(volumes)
+            vm = VolumeMomentum(volumes, regime=regime, closes=closes,
+                               vol_history=vol_history)
             r = vm.analyze()
 
             results.append({
@@ -127,6 +143,7 @@ def run_scan(top_n=200, regime="neutral", kline_days=50):
                 "signal": r["signal"],
                 "suggestion": r["suggestion"],
                 "checks_passed": r["checks_passed"],
+                "percentile": r.get("percentile"),
             })
         except Exception:
             errors += 1
@@ -184,6 +201,15 @@ def print_analysis(results):
         signals[s] = signals.get(s, 0) + 1
     for s, cnt in sorted(signals.items(), key=lambda x: -x[1]):
         print(f"   {s}: {cnt} ({cnt/len(results)*100:.1f}%)")
+
+    # 3b. 百分位分布
+    pcts = [r.get("percentile") for r in results if r.get("percentile") is not None]
+    if pcts:
+        pct_bands = [(90, "强(>=P90)"), (75, "中(>=P75)"), (50, "一般(>=P50)"), (25, "弱(>=P25)"), (0, "极弱(<P25)")]
+        print(f"\n3b. 百分位信号分布 (n={len(pcts)})")
+        for lo, label in pct_bands:
+            count = sum(1 for p in pcts if p >= lo)
+            print(f"   {label}: {count} ({count/len(pcts)*100:.1f}%)")
 
     # 4. 描述统计
     for name, arr in [("综合分", scores), ("斜率", slopes)]:

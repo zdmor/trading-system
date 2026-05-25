@@ -56,17 +56,20 @@ class VolumeMomentum:
         (float("-inf"), 0.5, "弱势信号", "量能极度萎缩，谨慎"),
     ]
 
-    def __init__(self, volumes: list, regime: str = "neutral", closes: list = None):
+    def __init__(self, volumes: list, regime: str = "neutral", closes: list = None,
+                 vol_history: list = None):
         """
         Args:
             volumes: 成交量序列（最近N天，最新在最后）
             regime: 市态 "bull" / "neutral" / "bear"
             closes: 收盘价序列（用于判断涨跌方向）
+            vol_history: 该股票历史量比序列（不含当日），用于百分位归一化
         """
         self.volumes = np.array(volumes, dtype=float)
         self.closes = np.array(closes, dtype=float) if closes else None
         self.regime = regime if regime in self.REGIME_PARAMS else "neutral"
         self.params = {**self.DEFAULTS, **self.REGIME_PARAMS[self.regime]}
+        self.vol_history = np.array(vol_history, dtype=float) if vol_history else None
 
     def calc_vol_ratio(self) -> np.ndarray:
         """量比序列：每个位置 / 前N日均量"""
@@ -131,7 +134,10 @@ class VolumeMomentum:
             pct_chg = (self.closes[-1] / self.closes[-2] - 1) * 100
 
         # 信号判定
-        signal, suggestion = self._classify(composite)
+        percentile = None
+        if self.vol_history is not None and len(self.vol_history) >= 20:
+            percentile = self._calc_percentile(current_ratio, self.vol_history)
+        signal, suggestion = self._classify(composite, percentile)
 
         # 量价方向判定
         direction = self._judge_direction(current_ratio, pct_chg)
@@ -150,6 +156,7 @@ class VolumeMomentum:
             "pct_chg": round(pct_chg, 2),
             "checks_passed": all(checks.values()),
             "checks": checks,
+            "percentile": percentile,
         }
 
     def _judge_direction(self, vol_ratio: float, pct_chg: float) -> str:
@@ -173,8 +180,27 @@ class VolumeMomentum:
             "斜率达标": slope >= p["slope_threshold"],
         }
 
-    def _classify(self, score: float) -> tuple:
-        """评分 → 信号等级"""
+    def _calc_percentile(self, value: float, history: np.ndarray) -> float:
+        """计算量比在自身历史中的百分位"""
+        if history is None or len(history) < 20:
+            return 50.0
+        rank = np.sum(history < value) / len(history) * 100
+        return round(min(99.0, max(1.0, rank)), 1)
+
+    def _classify(self, score: float, percentile: float = None) -> tuple:
+        """评分 → 信号等级。优先百分位，回退绝对阈值"""
+        if percentile is not None:
+            if percentile >= 90:
+                return "强信号", "量能处于自身历史高位，重点关注"
+            elif percentile >= 75:
+                return "中等信号", "量能高于常态，结合走势确认"
+            elif percentile >= 50:
+                return "一般信号", "量能正常，观望或持仓"
+            elif percentile >= 25:
+                return "偏弱", "量能偏低，不急于进场"
+            else:
+                return "弱势信号", "量能极度萎缩，谨慎对待"
+        # 回退：绝对阈值
         for lo, hi, signal, suggestion in self.SCORE_BANDS:
             if lo <= score < hi:
                 return signal, suggestion
