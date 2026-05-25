@@ -5,6 +5,14 @@
 
 ---
 
+## v1.6.1-factorstats (2026-05-26)
+- 修改: kelly_position.py FACTOR_STATS 基于 IC 回测数据更新
+- 更新: tech_strength 0.55→0.56, risk_reward 0.58→0.39, volume 0.53→0.41
+- 更新: candlestick 0.51→0.51(不变), sector 0.54→0.37, relative_strength 0.56→0.51
+- 修复: sector 因子板块缓存 + sector_heat fallback
+
+---
+
 ## v1.6.0-evolution (2026-05-26)
 - 新增: 滚动 IC 数据库（ic_rolling_db.json），每日扫描自动积累因子-收益对
 - 新增: 时间衰减 IC（60天半衰期），近期数据权重高于历史

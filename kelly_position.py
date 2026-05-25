@@ -22,12 +22,12 @@ import numpy as np
 # avg_win: 正收益均值 (%)
 # avg_loss: 负收益均值 (%) 的绝对值
 FACTOR_STATS = {
-    "tech_strength":   {"win_rate": 0.55, "avg_win": 3.2, "avg_loss": 2.8},
-    "risk_reward":     {"win_rate": 0.58, "avg_win": 3.5, "avg_loss": 2.5},
-    "volume":          {"win_rate": 0.53, "avg_win": 3.0, "avg_loss": 2.9},
+    "tech_strength":   {"win_rate": 0.56, "avg_win": 3.2, "avg_loss": 2.8},
+    "risk_reward":     {"win_rate": 0.39, "avg_win": 3.5, "avg_loss": 3.5},
+    "volume":          {"win_rate": 0.41, "avg_win": 3.0, "avg_loss": 3.2},
     "candlestick":     {"win_rate": 0.51, "avg_win": 2.5, "avg_loss": 2.5},
-    "sector":          {"win_rate": 0.54, "avg_win": 2.8, "avg_loss": 2.6},
-    "relative_strength": {"win_rate": 0.56, "avg_win": 3.3, "avg_loss": 2.7},
+    "sector":          {"win_rate": 0.37, "avg_win": 2.8, "avg_loss": 3.0},
+    "relative_strength": {"win_rate": 0.51, "avg_win": 3.3, "avg_loss": 3.0},
 }
 
 # 文件持久化路径
