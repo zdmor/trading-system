@@ -12,8 +12,9 @@ ICIR = mean_ic / std_ic — 衡量因子稳定性与预测能力的综合指标
 import json
 import os
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
+from collections import defaultdict
 
 # 基础权重（P1-4 六因子架构，合计 1.0）
 BASE_WEIGHTS = {
@@ -146,6 +147,153 @@ def show_weight_report():
     print(f"  {'-'*55}")
     print(f"  {'合计':<18} {sum(base.values()):>6.0%} {sum(eff.values()):>6.0%}")
     print()
+
+
+# ─── 滚动 IC 数据库 + 时间衰减 ───
+
+_ROLLING_DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ic_rolling_db.json")
+_FACTOR_KEYS = ["tech_strength", "risk_reward", "volume", "candlestick", "sector", "relative_strength"]
+
+
+def _spearman_rank(x, y):
+    n = len(x)
+    if n < 3:
+        return 0.0
+    rx = np.argsort(np.argsort(x))
+    ry = np.argsort(np.argsort(y))
+    d = rx - ry
+    return float(1 - 6 * np.sum(d**2) / (n * (n**2 - 1)))
+
+
+def _load_rolling_db() -> dict:
+    if os.path.exists(_ROLLING_DB_FILE):
+        try:
+            with open(_ROLLING_DB_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {"pairs": [], "pending": []}
+    return {"pairs": [], "pending": []}
+
+
+def _save_rolling_db(db: dict):
+    with open(_ROLLING_DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
+
+
+def append_snapshot(code: str, date: str, price: float,
+                    factors: dict, db: dict = None):
+    """存储因子快照，5 日后自动验证收益。"""
+    was_provided = db is not None
+    if db is None:
+        db = _load_rolling_db()
+    existing = {(p["code"], p["date"]) for p in db.get("pending", [])}
+    key = (code, date)
+    if key not in existing:
+        db["pending"].append({
+            "date": date,
+            "code": code,
+            "factors": {k: factors.get(k, 50) for k in _FACTOR_KEYS},
+            "price": price,
+        })
+    if not was_provided:
+        _save_rolling_db(db)
+    return db
+
+
+def check_pending(outcome_prices: dict) -> int:
+    """检查到期 pending，计算 5 日收益，移入 pairs。
+
+    每个 run.py 执行时自动调用。
+    需要 outcome_prices: {code: 当前价格}
+    """
+    db = _load_rolling_db()
+    today = datetime.now()
+    new_pending = []
+    completed = 0
+
+    for p in db.get("pending", []):
+        try:
+            dt = datetime.strptime(p["date"], "%Y-%m-%d")
+        except ValueError:
+            continue
+        days_passed = (today - dt).days
+        code = p["code"]
+
+        if days_passed >= 5:
+            cur_price = outcome_prices.get(code)
+            if cur_price and p["price"] > 0:
+                fwd = (cur_price / p["price"] - 1) * 100
+                db.setdefault("pairs", []).append({
+                    "date": p["date"],
+                    "code": code,
+                    "factors": p["factors"],
+                    "fwd_5d": round(fwd, 2),
+                })
+                completed += 1
+        else:
+            new_pending.append(p)
+
+    db["pending"] = new_pending
+    _save_rolling_db(db)
+    return completed
+
+
+def recompute_ic_from_rolling(halflife: int = 60) -> Optional[dict]:
+    """从滚动 pairs 计算带时间衰减的 IC/ICIR，更新缓存。
+
+    按日期分组 → 每截面 Spearman IC → 指数衰减加权均值/标准差
+
+    Args:
+        halflife: 衰减半衰期（天），默认 60 天
+
+    Returns:
+        {因子key: {ic, icir, win_rate}} 或 None（样本不足 50）
+    """
+    db = _load_rolling_db()
+    pairs = db.get("pairs", [])
+    if len(pairs) < 50:
+        return None  # 样本不足以计算
+
+    today = datetime.now()
+    date_groups = defaultdict(list)
+    for p in pairs:
+        date_groups[p["date"]].append(p)
+
+    ic_by_factor = {k: {"ics": [], "ws": []} for k in _FACTOR_KEYS}
+
+    for date_str, group in date_groups.items():
+        if len(group) < 10:
+            continue
+        try:
+            days_ago = (today - datetime.strptime(date_str, "%Y-%m-%d")).days
+        except ValueError:
+            continue
+        w = 2 ** (-days_ago / halflife)
+
+        for k in _FACTOR_KEYS:
+            scores = np.array([p["factors"].get(k, 50) for p in group])
+            fwds = np.array([p["fwd_5d"] for p in group])
+            ic = _spearman_rank(scores, fwds)
+            ic_by_factor[k]["ics"].append(ic)
+            ic_by_factor[k]["ws"].append(w)
+
+    ic_data = {}
+    for k in _FACTOR_KEYS:
+        ics = np.array(ic_by_factor[k]["ics"])
+        ws = np.array(ic_by_factor[k]["ws"])
+        if len(ics) < 3:
+            continue
+        w_mean = float(np.average(ics, weights=ws))
+        variance = float(np.average((ics - w_mean) ** 2, weights=ws)) if len(ics) > 1 else 0.001
+        w_std = np.sqrt(variance) if variance > 0 else 0.001
+        icir = w_mean / max(w_std, 0.001)
+        win_rate = float(np.sum((ics > 0) * ws) / max(np.sum(ws), 0.001))
+        ic_data[k] = {"ic": round(w_mean, 4), "icir": round(icir, 4), "win_rate": round(win_rate, 4)}
+
+    if ic_data:
+        update_ic_cache(ic_data)
+        print(f"  [自动进化] IC 已从 {len(pairs)} 对滚动数据重算，半衰期 {halflife}d")
+    return ic_data
 
 
 # ─── 因子分歧度 ───

@@ -2,6 +2,7 @@
 多因子个股评分系统
 对个股从6个维度综合评分，输出操作建议和理由
 """
+import os
 import numpy as np
 import pandas as pd
 from data_providers import AkshareProvider
@@ -46,6 +47,21 @@ try:
     _VOL_MOMENTUM = True
 except ImportError:
     _VOL_MOMENTUM = False
+
+# 动态因子权重系统（ICIR驱动）
+try:
+    from factor_weights import get_weights
+    _DYNAMIC_WEIGHTS_OK = True
+except ImportError:
+    _DYNAMIC_WEIGHTS_OK = False
+
+# 多因子多空辩论模块
+try:
+    from bull_bear_debate import debate_factors
+    _DEBATE_OK = True
+except ImportError:
+    _DEBATE_OK = False
+
 WEIGHTS = {
     "tech_strength": 0.28,       # 威科夫+趋势动量合并 (原20+15=35→折合28，消除共线冗余)
     "risk_reward": 0.18,         # 盈亏比 (16→18)
@@ -65,8 +81,49 @@ SCORE_LEVELS = [
     (0, "离场", -1.0),
 ]
 
+# 校准期望准确率（用于自动纠偏乐观/悲观偏差）
+_CALIB_EXPECTED = {"80": 0.62, "70": 0.56, "60": 0.52, "50": 0.48}
+_CALIB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration.json")
 
-def score_to_level(composite_score):
+
+def _score_bracket(score):
+    if score >= 80: return "80"
+    if score >= 70: return "70"
+    if score >= 60: return "60"
+    return "50"
+
+
+def _apply_calibration(composite):
+    """基于历史校准数据修正评分。
+
+    如果某档位历史准确率低于期望，自动下调评分（系统性乐观偏误修正）；
+    高于期望则上调（保守偏误修正）。
+    """
+    bracket = _score_bracket(composite)
+    try:
+        if not os.path.exists(_CALIB_FILE):
+            return composite, ""
+        import json
+        with open(_CALIB_FILE, encoding="utf-8") as f:
+            calib = json.load(f)
+        bucket = calib.get(bracket, {})
+        count = bucket.get("count", 0)
+        accuracy = bucket.get("accuracy", 0.5)
+        if count < 10:
+            return composite, "校准样本不足"
+        expected = _CALIB_EXPECTED.get(bracket, 0.5)
+        gap = expected - accuracy
+        if gap > 0.05:
+            penalty = int(gap * 100)
+            adjusted = max(0, composite - penalty)
+            return adjusted, f"校准{penalty:+.0f}({accuracy:.0%}<{expected:.0%})"
+        elif gap < -0.05:
+            bonus = int(abs(gap) * 100)
+            adjusted = min(100, composite + bonus)
+            return adjusted, f"校准+{bonus}({accuracy:.0%}>{expected:.0%})"
+        return composite, ""
+    except Exception:
+        return composite, ""
     """综合分 → (操作标签, 仓位系数)"""
     for threshold, action, factor in SCORE_LEVELS:
         if composite_score >= threshold:
@@ -779,10 +836,11 @@ class StockScorer:
         except Exception:
             factors["market"] = {"score": 50, "label": "中", "detail": "计算异常"}
 
-        # 加权综合
+        # 加权综合（动态权重优先）
         composite = 0.0
         breakdown_lines = []
-        for key, weight in WEIGHTS.items():
+        active_weights = get_weights() if _DYNAMIC_WEIGHTS_OK else WEIGHTS
+        for key, weight in active_weights.items():
             f = factors[key]
             contribution = f["score"] * weight
             composite += contribution
@@ -797,6 +855,17 @@ class StockScorer:
             })
 
         composite = round(composite, 1)
+
+        # 校准纠偏（基于历史评分准确率自动修正系统性偏差）
+        calib_adjust, calib_note = _apply_calibration(composite)
+        if calib_note:
+            if calib_adjust != composite:
+                composite = round(calib_adjust, 1)
+            breakdown_lines.append({
+                "key": "calibration", "weight": 0, "score": 0,
+                "contribution": 0, "label": "校准",
+                "detail": calib_note, "weight_pct": 0,
+            })
 
         # 深度研究个股加分（可选）
         research_bonus = 0
@@ -844,6 +913,17 @@ class StockScorer:
                 matrix_factor = get_position_factor(market_score, sector_score)
                 pos_factor = min(pos_factor, matrix_factor)
                 pos_factor = max(0.0, min(1.0, pos_factor))
+            except Exception:
+                pass
+
+        # 多因子多空辩论（修正仓位）
+        if _DEBATE_OK:
+            try:
+                debate_result = debate_factors(breakdown_lines, composite)
+                if debate_result.get("veto_triggered"):
+                    pos_factor = min(pos_factor, 0.3)
+                elif debate_result.get("verdict") == "争议":
+                    pos_factor = min(pos_factor, 0.5)
             except Exception:
                 pass
 

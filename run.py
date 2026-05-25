@@ -688,6 +688,47 @@ def run(watch_stocks=None, min_amount=5e8, top_n=15, max_scan=200):
     except Exception:
         pass
 
+    # ====== 5g. 自主进化：滚动 IC 数据库 + 时间衰减 ======
+    try:
+        from factor_weights import append_snapshot, check_pending, recompute_ic_from_rolling
+
+        # 构建今日价格表（scanner 结果中已有最新价）
+        price_lookup = {}
+        for r in s.results:
+            sym = r["code"].split(".")[1] if "." in r["code"] else r["code"]
+            price_lookup[sym] = r["price"]
+
+        # 检查到期 pending 并计算 5 日收益
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        completed = check_pending(price_lookup)
+
+        # 存储今日因子快照（从持仓分析结果中提取）
+        db = None
+        for sym in watch_stocks:
+            try:
+                pos = None
+                if sym == "002050":
+                    pos = {"shares": 100, "avg_price": 51.44}
+                elif sym == "600038":
+                    pos = {"shares": 300, "avg_price": 35.374}
+                elif sym == "600416":
+                    pos = {"shares": 400, "avg_price": 13.285}
+                _, _, price, _, td = analyze_stock(sym, 80000, pos, market_health=health, pe_cap=pe_cap)
+                sr = td.get("scoring_result")
+                if sr and sr.get("factors"):
+                    factors_flat = {f["key"]: f["score"] for f in sr["factors"] if "score" in f}
+                    db = append_snapshot(sym, today_str, price, factors_flat, db)
+            except Exception:
+                continue
+
+        # 从滚动数据重算 IC（样本足够时自动更新权重）
+        recompute_ic_from_rolling(halflife=60)
+
+        if completed > 0:
+            print(f"  [自动进化] 完成 {completed} 对收益验证")
+    except Exception as e:
+        print(f"  [自动进化] 跳过: {e}")
+
     # ====== 6. 总结 ======
     bullish = sum(1 for r in s.results if r["trend"] == "多头")
     print(f"\n{'='*62}")

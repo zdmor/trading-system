@@ -5,6 +5,15 @@
 
 ---
 
+## v1.6.0-evolution (2026-05-26)
+- 新增: 滚动 IC 数据库（ic_rolling_db.json），每日扫描自动积累因子-收益对
+- 新增: 时间衰减 IC（60天半衰期），近期数据权重高于历史
+- 新增: 校准反馈闭环（calibration.json → 评分纠偏），系统性乐观/悲观自动修正
+- 修改: run.py 集成自主进化钩子，扫描即学习
+- 修改: scoring.py 集成校准纠偏
+
+---
+
 ## v1.5.0-icbridge (2026-05-25)
 - 新增: p1_8_ic_backtest.py 全因子IC回测（新6因子 + 市态分组）
 - 新增: IC缓存桥接 — p1_8_ic_backtest.py 自动写入 factor_ic_cache.json
