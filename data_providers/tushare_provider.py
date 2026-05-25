@@ -23,8 +23,19 @@ _pro = None
 def _get_pro():
     global _pro
     if _pro is None:
+        import json, os
         import tushare as ts
-        ts.set_token('6209f704e5762ae2e03088c18b08c22d5d9350d36962a0ee067e108f')
+        cfg_path = os.path.join(os.path.dirname(__file__), '..', 'config.json')
+        token = ''
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+            token = cfg.get('_tushare', {}).get('token', '')
+        except Exception:
+            pass
+        if not token:
+            raise RuntimeError("Tushare token not found in config.json[_tushare.token]")
+        ts.set_token(token)
         _pro = ts.pro_api()
     return _pro
 

@@ -28,16 +28,26 @@ except ImportError:
     _RESEARCH_TRACKER_OK = False
 
 
-# 因子权重
+try:
+    from buzz_monitor import get_stock_buzz
+    _BUZZ_TOOL = True
+except ImportError:
+    _BUZZ_TOOL = False
+
+try:
+    from volume_momentum import VolumeMomentum
+    _VOL_MOMENTUM = True
+except ImportError:
+    _VOL_MOMENTUM = False
 WEIGHTS = {
     "wyckoff": 0.20,
     "risk_reward": 0.16,
-    "volume": 0.12,
-    "candlestick": 0.07,
+    "volume": 0.09,
+    "candlestick": 0.05,
     "sector": 0.11,
-    "momentum": 0.12,
+    "momentum": 0.15,
     "market": 0.12,
-    "relative_strength": 0.10,
+    "relative_strength": 0.12,
 }
 
 # 评分 → 操作映射
@@ -222,72 +232,71 @@ class StockScorer:
             "ratio": rr_ratio,
         }
 
-    # ─────────────────────── 因子3: 量能分析 ───────────────────────
+    # ─────────────────────── 因子3: 量能分析（量比动量系统） ───────────────────────
 
     def score_volume(self):
-        """量能分析评分 (权重15%)"""
+        """量比动量评分 (权重9%)
+        基于 VolumeMomentum 的量比均线+斜率+综合评分
+        """
         try:
-            closes = self.df["close"].values.astype(float)
             volumes = self.df["volume"].values.astype(float)
+            closes = self.df["close"].values.astype(float)
         except Exception:
             return {"score": 50, "label": "中", "detail": "数据不足", "vol_ratio": 0}
 
-        if len(volumes) < 25:
+        if len(volumes) < 10:
             return {"score": 50, "label": "中", "detail": "数据不足", "vol_ratio": 0}
 
-        # 量比 = 当日量 / 20日均量
-        latest_v = float(volumes[-1])
-        avg_20 = float(np.mean(volumes[-21:-1])) if len(volumes) >= 21 else 1
-        vol_ratio = latest_v / avg_20 if avg_20 > 0 else 1
+        # 市态判定（用已有大盘数据或默认中性）
+        regime = "neutral"
+        if hasattr(self, "market_df") and self.market_df is not None:
+            try:
+                idx_closes = self.market_df["close"].values.astype(float)
+                regime = VolumeMomentum.recommend_regime(list(idx_closes))
+            except Exception:
+                pass
 
-        # 量趋势：近5日 / 前10日
-        avg_5 = float(np.mean(volumes[-6:-1])) if len(volumes) >= 6 else 1
-        avg_prior_10 = float(np.mean(volumes[-16:-6])) if len(volumes) >= 16 else 1
-        vol_trend = avg_5 / avg_prior_10 if avg_prior_10 > 0 else 1.0
+        # 量比动量分析
+        vm = VolumeMomentum(list(volumes), regime=regime, closes=list(closes))
+        result = vm.analyze()
 
-        # 价格涨跌
+        # 综合评分 → 0-100 映射
+        cs = result["composite_score"]
+        direction = result.get("direction", "正常")
+        if cs >= 3.5:
+            base = 85
+            if direction == "放量上涨":
+                base = 92
+            elif direction == "放量下跌":
+                base = 50
+        elif cs >= 2.0:
+            base = 65 + (cs - 2.0) / 1.5 * 15  # 65-80
+        elif cs >= 1.3:
+            base = 45 + (cs - 1.3) / 0.7 * 20  # 45-65
+        elif cs >= 0.5:
+            base = 30 + (cs - 0.5) * 15  # 30-45
+        else:
+            base = 20
+
+        # 三重过滤调整
+        checks_passed = result["checks_passed"]
+        if not checks_passed:
+            base -= 15  # 过滤不通过扣分
+        elif result["slope"] > 0.1:
+            base += 10  # 加速放量加分
+
+        # 支撑/阻力附加判断
         price_chg = (closes[-1] / closes[-2] - 1) * 100 if len(closes) >= 2 else 0
+        vol_ratio = result["vol_ratio"]
 
-        # 评分
-        if 1.2 <= vol_ratio <= 2.5:
-            if vol_trend >= 1.1:
-                base = 80  # 温和放量，量趋势上升
-            else:
-                base = 60  # 温和放量，量持平
-        elif vol_ratio > 2.5:
-            if price_chg < 1.0:
-                base = 30  # 巨量滞涨（警惕派发）
-            elif price_chg >= 3.0:
-                base = 75  # 巨量大涨（SOS确认）
-            else:
-                base = 55  # 巨量小涨
-        elif 0.5 <= vol_ratio <= 1.2:
-            base = 50  # 量平
-        else:  # < 0.5
-            base = 40  # 缩量
-
-        # 在支撑位附近缩量 → 抛压枯竭加分
-        if self.supports and vol_ratio < 0.7:
-            nearest_support = self.supports[-1]
-            dist = (self.price - nearest_support) / self.price * 100
-            if 0 <= dist < 3:
-                base += 10
-
-        final = max(0, min(100, base))
-        vol_trend_str = f"{'上升' if vol_trend >= 1.05 else '下降' if vol_trend <= 0.95 else '持平'}"
-        detail_parts = [f"量比{vol_ratio:.1f}倍 量趋势{vol_trend_str}"]
-
-        # ── 突破确认：关键位+放量=有效，关键位+缩量=假突破 ──
         if self.supports:
             nearest_s = self.supports[-1]
             dist_s = (nearest_s - self.price) / self.price * 100
             if dist_s < 0 and abs(dist_s) < 3:
                 if vol_ratio >= 1.5:
                     base -= 15
-                    detail_parts.append("放量破支撑 -15")
                 elif vol_ratio < 0.8:
                     base += 12
-                    detail_parts.append("缩量假跌破 +12")
 
         if self.resistances:
             nearest_r = self.resistances[0]
@@ -295,16 +304,24 @@ class StockScorer:
             if dist_r > 0 and abs(dist_r) < 3:
                 if vol_ratio >= 1.5:
                     base += 15
-                    detail_parts.append("放量破阻力 +15")
                 elif vol_ratio < 0.8:
                     base -= 12
-                    detail_parts.append("缩量假突破 -12")
 
         final = max(0, min(100, base))
+        detail_parts = [
+            f"量比{result['vol_ratio']:.1f}",
+            f"均线{result['vol_ratio_ma']:.1f}",
+            f"斜率{result['slope']:.2f}",
+            f"综合{result['composite_score']:.1f}",
+            result['direction'],
+            result['signal'],
+        ]
+
         return {
             "score": final, "label": self._label(final),
             "detail": " | ".join(detail_parts),
             "vol_ratio": round(vol_ratio, 2),
+            "vol_momentum": result,
         }
 
     # ─────────────────────── 因子4: K线形态 ───────────────────────
@@ -471,8 +488,6 @@ class StockScorer:
             "detail": f"{industry} {change:+.2f}% 排名{target['rank']}/{target['total']}",
             "rank_pct": round(rank_pct, 1),
         }
-            "change_pct": change,
-        }
 
     # ─────────────────────── 因子6: 趋势与动量 ───────────────────────
 
@@ -500,21 +515,25 @@ class StockScorer:
         except Exception:
             pass
 
-        # RSI
+        # RSI — 方向修正 2026-05-24: 历史IC证明RSI是动量指标不是反转指标
+        # 高RSI(>60)=强势延续，低RSI(<40)=弱势延续
         try:
             closes = self.df["close"].values.astype(float)
             rsi = self._calc_rsi(closes)
-            if 40 <= rsi <= 60:
-                details.append(f"RSI{rsi} 中性")
-            elif 30 <= rsi < 40:
-                base += 10
-                details.append(f"RSI{rsi} 超卖反弹潜力 +10")
+            if rsi > 70:
+                base += 15
+                details.append(f"RSI{rsi} 强势延续 +15")
             elif 60 < rsi <= 70:
                 base += 10
-                details.append(f"RSI{rsi} 强势 +10")
-            elif rsi < 30 or rsi > 70:
+                details.append(f"RSI{rsi} 偏强 +10")
+            elif 40 <= rsi <= 60:
+                details.append(f"RSI{rsi} 中性")
+            elif 30 <= rsi < 40:
+                base -= 5
+                details.append(f"RSI{rsi} 偏弱 -5")
+            else:  # rsi < 30
                 base -= 10
-                details.append(f"RSI{rsi} 极端区域 -10")
+                details.append(f"RSI{rsi} 弱势 -10")
         except Exception:
             rsi = 50
 

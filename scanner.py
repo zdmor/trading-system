@@ -29,6 +29,33 @@ try:
 except ImportError:
     _RESEARCH_TOOL = False
 
+try:
+    from recommendation_tracker import save_scan_result, print_review
+    _REC_TRACKER = True
+except ImportError:
+    _REC_TRACKER = False
+
+from pattern_detector import PatternDetector
+from notifier import send_card, make_div, make_hr, make_note
+
+try:
+    from lhb_analyzer import enrich_stock_list, analyze_stock
+    _LHB_TOOL = True
+except ImportError:
+    _LHB_TOOL = False
+
+try:
+    from sentiment_indicator import get_sentiment, get_daily_sentiment, get_weekly_sentiment, get_monthly_sentiment
+    _SENTIMENT_TOOL = True
+except ImportError:
+    _SENTIMENT_TOOL = False
+
+try:
+    from buzz_monitor import scan_overheat, get_buzz_growth, get_stock_buzz
+    _BUZZ_TOOL = True
+except ImportError:
+    _BUZZ_TOOL = False
+
 
 # ============================================================
 # 配置加载
@@ -342,7 +369,7 @@ class WyckoffAnalyzer:
     def detect_upthrust(cls, closes, highs, lows, volumes, trend):
         """上冲回落：价格突破阻力后迅速收回，放量"""
         cfg = cls._cfg("upthrust")
-        if not cfg.get("enabled", True):
+        if not cfg.get("enabled", True) or trend in cfg.get("exclude_trends", ["空头"]):
             return None
         if len(closes) < cfg.get("min_bars", 20):
             return None
@@ -1018,6 +1045,28 @@ class Scanner:
                 result["phase"] = phase
                 result["phase_detail"] = phase_detail
 
+            # 形态学检测（双顶/双底/头肩顶底/V转）
+            result["pattern_name"] = "-"
+            result["pattern_score"] = 0
+            result["pattern_detail"] = ""
+            if len(closes) >= 40:
+                patterns = PatternDetector.analyze_all(
+                    np.array(closes), np.array(highs),
+                    np.array(lows), np.array(volumes),
+                    trend=result["trend"]
+                )
+                if patterns:
+                    result["pattern_name"] = patterns[0].name
+                    result["pattern_score"] = patterns[0].score
+                    det = patterns[0].detail
+                    if patterns[0].confirmed:
+                        det += " [确认]"
+                    elif "颈线" in det or "站上" in det or "跌破" in det:
+                        det += " [未确认]"
+                    result["pattern_detail"] = det
+                    result["_all_patterns"] = [(p.name, p.score, p.direction,
+                                                p.confirmed, p.target) for p in patterns]
+
         except Exception:
             pass
 
@@ -1168,6 +1217,28 @@ class Scanner:
 
     # ==================== 报告 ====================
 
+    def _calc_breadth(self):
+        """从全市场快照计算涨跌比、涨跌停"""
+        up = down = limit_up = limit_down = 0
+        for v in self.snapshot.values():
+            chg = v.get("change_pct", 0)
+            if chg > 0:
+                up += 1
+            elif chg < 0:
+                down += 1
+            if chg >= 9.8:
+                limit_up += 1
+            elif chg <= -9.8:
+                limit_down += 1
+        total = up + down
+        ad_ratio = round(up / down, 2) if down > 0 else 99
+        ul_ratio = round(limit_up / limit_down, 2) if limit_down > 0 else limit_up
+        return {
+            "up": up, "down": down, "total": total,
+            "ad_ratio": ad_ratio, "limit_up": limit_up,
+            "limit_down": limit_down, "ul_ratio": ul_ratio,
+        }
+
     def _get_concept_board_performance(self):
         """获取概念板块当日涨幅Top10（用于市场情绪参考）"""
         try:
@@ -1189,6 +1260,31 @@ class Scanner:
             if t not in ("-", "无信号", "数据不足"):
                 sig_counts[t] = sig_counts.get(t, 0) + 1
 
+        # 推荐回顾
+        if _REC_TRACKER:
+            print_review()
+
+        # 龙虎榜数据（缓存一次，全报告复用）
+        lhb_map = {}
+        lhb_holdings = {}
+        if _LHB_TOOL:
+            try:
+                codes_ts = []
+                for r in self.results:
+                    c = r["code"].split(".")[1]
+                    suffix = ".SZ" if not c.startswith("6") else ".SH"
+                    codes_ts.append(c + suffix)
+                lhb_map = enrich_stock_list(codes_ts)
+                if hasattr(self, "watchlist_results"):
+                    for h in self.watchlist_results.get("holdings", []):
+                        code = h["code"]
+                        ts_code = code + (".SZ" if not code.startswith("6") else ".SH")
+                        h_info = analyze_stock(ts_code)
+                        if h_info:
+                            lhb_holdings[code] = h_info
+            except Exception:
+                pass
+
         print("\n" + "=" * 80)
         print(f"  A股扫描报告  {now}")
         print("=" * 80)
@@ -1209,52 +1305,164 @@ class Scanner:
             print("  无符合条件标的")
             return
 
-        # === 大盘概况 ===
+        # === 市场情绪指标（三层） ===
+        if _SENTIMENT_TOOL:
+            try:
+                d = get_daily_sentiment()
+                w = get_weekly_sentiment()
+                m = get_monthly_sentiment()
+                c = get_sentiment()
+
+                def items_line(items):
+                    return " | ".join(f"{it['name']}{it['value']}[{it['level']}]" for it in items)
+
+                mom_icon = {"升温": "↗", "降温": "↘", "持平": "→"}.get(w["momentum"], "")
+                print(f"  ══ 市场情绪 ══  综合:{c['score']}[{c['level']}]")
+                print(f"  日频: {d['score']}[{d['level']}]  {items_line(d['items'])}")
+                print(f"  周频: {w['score']}[{w['level']}]  {mom_icon}Δ{w['delta']:+d}  {items_line(w['items'])}")
+                print(f"  月频: {m['score']}[{m['level']}]  {items_line(m['items'])}")
+                print()
+            except Exception:
+                pass
+
+        # === 大盘健康状况 ===
         try:
             from market import MarketAnalyzer
             indices = MarketAnalyzer.fetch_indices()
-            if indices:
-                print(f"  【大盘概况】")
-                for key in ["sh000001", "sz399001", "sz399006", "sh000688"]:
-                    idx = indices.get(key)
-                    if idx:
-                        arrow = "+" if idx["change_pct"] >= 0 else ""
-                        print(f"  {idx['name']:<8} {idx['price']:<10.2f}  {arrow}{idx['change_pct']:+.2f}%")
+        except Exception:
+            indices = {}
+
+        breadth = self._calc_breadth()
+
+        print(f"  【大盘健康状况】")
+        # 指数
+        idx_line = ""
+        if indices:
+            for key in ["sh000001", "sz399001", "sz399006", "sh000688"]:
+                idx = indices.get(key)
+                if idx:
+                    idx_line += f"{idx['name']}{idx['change_pct']:+.2f}% "
+        print(f"  指数: {idx_line}")
+
+        # 涨跌统计
+        if breadth:
+            ad = breadth.get("ad_ratio", 0)
+            up = breadth.get("up", 0)
+            down = breadth.get("down", 0)
+            lu = breadth.get("limit_up", 0)
+            ld = breadth.get("limit_down", 0)
+            # 判断涨跌状态
+            if ad >= 2:
+                ad_label = "普涨格局"
+            elif ad >= 1.2:
+                ad_label = "涨多跌少"
+            elif ad >= 0.8:
+                ad_label = "偏弱"
+            else:
+                ad_label = "极弱"
+            if lu > ld * 3 and lu > 30:
+                emo_label = "做多情绪强"
+            elif lu > ld:
+                emo_label = "正常"
+            else:
+                emo_label = "做空占优"
+
+            print(f"  涨跌: {up}涨/{down}跌  (涨跌比{ad}, {ad_label})")
+            print(f"  涨停: {lu}只  跌停: {ld}只  ({emo_label})")
+
+        # PE分位
+        try:
+            pe_info, cap = MarketAnalyzer.get_pe_percentile()
+            if pe_info:
+                print(f"  估值: PE {pe_info['pe']} 近5年{pe_info['percentile']}%分位 ({pe_info['level']})")
         except Exception:
             pass
 
-        # === 板块分布 ===
+        # 综合健康判断
+        health_p = 0
+        health_w = 0
+        if indices:
+            avg_chg = np.mean([i["change_pct"] for i in indices.values()])
+            if avg_chg >= 0.5:
+                health_p += 1
+            elif avg_chg <= -0.5:
+                health_w += 1
+        if breadth:
+            if breadth["ad_ratio"] >= 1.5:
+                health_p += 1
+            elif breadth["ad_ratio"] < 0.8:
+                health_w += 1
+            if breadth["ul_ratio"] >= 3:
+                health_p += 1
+            elif breadth["ul_ratio"] < 1:
+                health_w += 1
+        score = health_p - health_w
+        if score >= 2:
+            hl = "健康 — 可积极参与"
+        elif score >= 1:
+            hl = "较好 — 精选个股操作"
+        elif score >= 0:
+            hl = "一般 — 注意仓位管理"
+        elif score >= -1:
+            hl = "偏弱 — 建议降低仓位"
+        else:
+            hl = "较差 — 防守为主"
+        print(f"  综合判断: {hl}")
+        print()
+
+        # === 热门板块轮动 ===
         sectors = {}
         for r in self.results:
             ind = r.get("industry", "其他")
             if ind not in sectors:
-                sectors[ind] = {"count": 0, "sig_count": 0, "names": []}
+                sectors[ind] = {"count": 0, "sig_count": 0, "sig_buy": 0, "names": []}
             sectors[ind]["count"] += 1
-            if r["wyckoff_sig"] not in ("-", "无信号", "数据不足"):
+            sig = r["wyckoff_sig"]
+            if sig not in ("-", "无信号", "数据不足"):
                 sectors[ind]["sig_count"] += 1
+                if sig in ("Spring", "SOS", "LPS", "弱Spring"):
+                    sectors[ind]["sig_buy"] += 1
             if len(sectors[ind]["names"]) < 3:
                 sectors[ind]["names"].append(r["name"])
 
         sorted_sec = sorted(sectors.items(), key=lambda x: -x[1]["count"])
-        print(f"  【板块分布】")
-        for ind, info in sorted_sec[:12]:
-            tag = f" S{info['sig_count']}信号" if info['sig_count'] > 0 else ""
+        print(f"  【热门板块轮动】")
+        print(f"  {'板块':<26} {'个股':<5} {'信号':<6} {'买入':<6} {'热度':<8} {'代表':<24}")
+        print(f"  " + "-" * 80)
+        for ind, info in sorted_sec[:10]:
+            sig_tag = f"  {info['sig_count']} " if info['sig_count'] > 0 else "  - "
+            buy_tag = f"  {info['sig_buy']} " if info['sig_buy'] > 0 else "  - "
+            # 热度
+            heat_str = "-"
+            try:
+                heat = get_sector_heat(ind)
+                if heat and heat.get("composite"):
+                    heat_str = f"{heat['composite']}"
+            except Exception:
+                pass
             top = ", ".join(info["names"])
-            print(f"  {ind:<18} {info['count']:>2}只{tag:<12} | {top}")
+            print(f"  {ind:<26} {info['count']:<5} {sig_tag:<6} {buy_tag:<6} {heat_str:<8} {top:<24}")
 
-        # 板块景气度 Top5（可选）
-        rt_cfg = self._sc.get("sector_heat", {})
-        if rt_cfg.get("enabled", True):
-            print(f"  【板块景气度 Top5】")
-            for ind, info in sorted_sec[:5]:
-                try:
-                    heat = get_sector_heat(ind)
-                    if heat and heat.get("composite"):
-                        hl = heat["level"]
-                        print(f"  {ind:<18} 热度{heat['composite']:>2}/100 ({hl})")
-                except Exception:
-                    pass
+        # 轮动判断
+        top_sector = sorted_sec[0][0] if sorted_sec else ""
+        top_count = sorted_sec[0][1]["count"] if sorted_sec else 0
+        total_analyzed = len(self.results)
+        concentration = top_count / total_analyzed * 100 if total_analyzed > 0 else 0
+        # 统计买入信号比例
+        total_buy = sum(1 for r in self.results if r["wyckoff_sig"] in ("Spring", "SOS", "LPS", "弱Spring") and r.get("quality_passed") == True)
+        total_sell = sum(1 for r in self.results if r["wyckoff_sig"] in ("Upthrust",) and r.get("quality_passed") == True)
+        # 板块数量
+        sec_count = len(sorted_sec)
 
+        if concentration > 50:
+            rotation_note = f"高度集中在{top_sector}，占比{concentration:.0f}%，缺乏接力板块"
+        elif concentration > 30:
+            rotation_note = f"集中在{top_sector}，占比{concentration:.0f}%，少量分散"
+        else:
+            rotation_note = f"分布相对分散({sec_count}个板块)，轮动正常"
+        if total_sell > total_buy * 2:
+            rotation_note += "，卖出信号偏多，注意回调风险"
+        print(f"  轮动: {rotation_note}")
         print()
 
         # === 股票池状态 ===
@@ -1279,8 +1487,8 @@ class Scanner:
             holdings = self.watchlist_results.get("holdings", [])
             if holdings:
                 print(f"  【持仓状态和建议】")
-                print(f"  {'代码':<8} {'名称':<8} {'趋势':<8} {'威科夫':<16} {'价格':<8} {'成本':<8} {'浮盈':<8} {'建议':<12}")
-                print(f"  " + "-" * 80)
+                print(f"  {'代码':<8} {'名称':<8} {'趋势':<8} {'威科夫':<16} {'价格':<8} {'成本':<8} {'浮盈':<8} {'龙虎榜':<10} {'建议':<12}")
+                print(f"  " + "-" * 92)
                 for s in holdings:
                     sym = s["code"]
                     nn = s["name"][:6]
@@ -1289,6 +1497,12 @@ class Scanner:
                     pr = f"{s['price']:.2f}" if s["price"] else "-"
                     cost = f"{s['cost']:.2f}" if s.get("cost") else "-"
                     pnl = f"{s['pnl_pct']:+.1f}%" if s.get("pnl_pct") is not None else "-"
+                    # 龙虎榜状态
+                    lhb_str = "-"
+                    if sym in lhb_holdings:
+                        hi = lhb_holdings[sym]
+                        net = hi.get('top_list', {}).get('net_amount', 0)
+                        lhb_str = f"净{net:+.2f}亿" if net else "上榜"
                     # 建议规则
                     sug = "持有"
                     if s["trend"] == "空头":
@@ -1299,13 +1513,46 @@ class Scanner:
                         sug = "加仓/持有"
                     elif s.get("pnl_pct") is not None and s["pnl_pct"] < -15:
                         sug = "警惕止损"
-                    print(f"  {sym:<8} {nn:<8} {tr:<8} {sg:<16} {pr:<8} {cost:<8} {pnl:<8} {sug:<12}")
+                    print(f"  {sym:<8} {nn:<8} {tr:<8} {sg:<16} {pr:<8} {cost:<8} {pnl:<8} {lhb_str:<10} {sug:<12}")
                 print()
+
+        # === 市值风云研究股票池 ===
+        if _RESEARCH_TOOL:
+            try:
+                import json as _json
+                rw_path = os.path.join(os.path.dirname(__file__), "research_watchlist.json")
+                if os.path.exists(rw_path):
+                    with open(rw_path, encoding="utf-8") as _f:
+                        rw_data = _json.load(_f)
+                    active_research = [s for s in rw_data.get("stocks", []) if s.get("active", True)]
+                    if active_research:
+                        print(f"  【市值风云研究股票池】")
+                        print(f"  {'代码':<8} {'名称':<8} {'扫描趋势':<10} {'信号':<16} {'现价':<8} {'确信度':<6}")
+                        print(f"  " + "-" * 62)
+                        for rs in active_research:
+                            code = rs["code"]
+                            name = rs.get("name", "")[:6]
+                            conviction = rs.get("conviction", "medium")[:4]
+                            bs_code = f"sh.{code}" if code.startswith("6") else f"sz.{code}"
+                            # 在results中查找
+                            found_r = next((r for r in self.results if r["code"] == bs_code), None)
+                            if found_r:
+                                trend = f"{found_r['trend']}({found_r['strength']:+.1f}%)" if found_r['trend'] in ("多头","空头") else found_r["trend"]
+                                sig_s = f"{found_r['wyckoff_sig']}({found_r['wyckoff_score']})" if found_r["wyckoff_sig"] not in ("-","无信号") else "-"
+                                price = f"{found_r['price']:.2f}"
+                            else:
+                                trend = "未入分析"
+                                sig_s = "-"
+                                price = "-"
+                            print(f"  {code:<8} {name:<8} {trend:<10} {sig_s:<16} {price:<8} {conviction:<6}")
+                        print()
+            except Exception:
+                pass
 
         # === Top N ===
         print(f"  [Top {top_n}]")
-        print(f"  {'#':<3} {'代码':<8} {'名称':<7} {'板块':<12} {'趋势':<10} {'威科夫':<18} {'价格':<8} {'成交额':<8} {'质地':<6}")
-        print(f"  " + "-" * 105)
+        print(f"  {'#':<3} {'代码':<8} {'名称':<7} {'板块':<12} {'趋势':<10} {'威科夫':<18} {'形态':<16} {'价格':<8} {'成交额':<8} {'质地':<6}")
+        print(f"  " + "-" * 125)
 
         for i, r in enumerate(self.results[:top_n]):
             sym = r["code"].split(".")[1]
@@ -1327,42 +1574,127 @@ class Scanner:
             sc = r["wyckoff_score"]
             sig_str = f"{sig}({sc})" if sig not in ("-", "无信号") else sig
 
+            # 形态信号
+            pn = r.get("pattern_name", "-")
+            ps = r.get("pattern_score", 0)
+            p_str = f"{pn}({ps})" if pn != "-" else "-"
+
             price = f"{r['price']:.2f}"
             amt = f"{r['amount']/1e8:.1f}亿"
             qf = "通过" if r.get("quality_passed") else ("未检" if r.get("quality_passed") is None else "未过")
-            print(f"  {i+1:<3} {sym:<8} {name:<7} {ind:<12} {trend:<10} {sig_str:<18} {price:<8} {amt:<8} {qf:<6}")
+            print(f"  {i+1:<3} {sym:<8} {name:<7} {ind:<12} {trend:<10} {sig_str:<18} {p_str:<16} {price:<8} {amt:<8} {qf:<6}")
 
         print()
 
-        # === 信号精选（仅展示通过质地的） ===
+        # === 龙虎榜异动 ===
+        if _LHB_TOOL and lhb_map:
+            print(f"  【龙虎榜异动】")
+            print(f"  {'代码':<8} {'名称':<7} {'净买入(亿)':<12} {'净率':<8} {'上榜原因':<26}")
+            print(f"  " + "-" * 65)
+            sorted_lhb = sorted(lhb_map.items(), key=lambda x: -abs(x[1].get('net_amount', 0)))
+            for ts_code, info in sorted_lhb:
+                name = info.get('name', '')[:6]
+                net = info.get('net_amount', 0)
+                net_str = f"{net:+.2f}" if net else "-"
+                rate = f"{info['net_rate']:.1f}%" if info.get('net_rate') else "-"
+                reason = (info.get('reason', '') or '')[:24]
+                print(f"  {ts_code:<8} {name:<7} {net_str:<12} {rate:<8} {reason:<26}")
+            print()
+
+        # === 推荐选股结果 ===
         valid = [r for r in self.results if r["wyckoff_sig"] not in ("-", "无信号", "数据不足", "无数据")]
         if valid:
-            # 对信号股票补充基本面 + 质地
             quality_ok = [r for r in valid if r.get("quality_passed") == True]
             if quality_ok:
                 enriched = self.enrich_with_financials(quality_ok, 10)
-                print(f"  【威科夫信号精选（质地通过）Top {min(10, len(quality_ok))}】")
-                print(f"  {'信号':<14} {'代码':<8} {'名称':<7} {'板块':<12} {'得分':<5} {'PE':<7} {'ROE':<6} {'细节':<24}")
-                print(f"  " + "-" * 88)
-                for r in enriched[:10]:
-                    sym = r["code"].split(".")[1]
-                    name = r["name"][:6]
-                    ind = r.get("industry", "其他")[:10]
-                    sig = r["wyckoff_sig"]
-                    sc = r["wyckoff_score"]
-                    pe = f"{r['pe']:.1f}" if r.get("pe") else "-"
-                    roe = f"{r['roe']:.1f}%" if r.get("roe") else "-"
-                    detail = r.get("wyckoff_detail", "")[:24]
-                    print(f"  {sig:<14} {sym:<8} {name:<7} {ind:<12} {sc:<5} {pe:<7} {roe:<6} {detail:<24}")
+                # 分成买入信号和卖出信号
+                buy_sigs = [r for r in enriched if r["wyckoff_sig"] in ("Spring", "SOS", "LPS", "弱Spring")]
+                sell_sigs = [r for r in enriched if r["wyckoff_sig"] in ("Upthrust", "弱Upthrust", "EVR")]
+
+                if buy_sigs:
+                    print(f"  【买入关注 — Spring/SOS/LPS】质地通过 {len(buy_sigs)}只")
+                    print(f"  {'信号':<12} {'代码':<8} {'名称':<7} {'板块':<12} {'得分':<5} {'PE':<7} {'ROE':<6} {'细节':<24}")
+                    print(f"  " + "-" * 88)
+                    for r in buy_sigs:
+                        sym = r["code"].split(".")[1]
+                        name = r["name"][:6]
+                        ind = r.get("industry", "其他")[:10]
+                        sig = r["wyckoff_sig"]
+                        sc = r["wyckoff_score"]
+                        pe = f"{r['pe']:.1f}" if r.get("pe") else "-"
+                        roe = f"{r['roe']:.1f}%" if r.get("roe") else "-"
+                        detail = r.get("wyckoff_detail", "")[:24]
+                        print(f"  {sig:<12} {sym:<8} {name:<7} {ind:<12} {sc:<5} {pe:<7} {roe:<6} {detail:<24}")
+                    print()
+
+                if sell_sigs:
+                    print(f"  【警示列表 — Upthrust】质地通过 {len(sell_sigs)}只（非买入点）")
+                    print(f"  {'信号':<12} {'代码':<8} {'名称':<7} {'板块':<12} {'得分':<5} {'PE':<7} {'ROE':<6} {'细节':<24}")
+                    print(f"  " + "-" * 88)
+                    for r in sell_sigs:
+                        sym = r["code"].split(".")[1]
+                        name = r["name"][:6]
+                        ind = r.get("industry", "其他")[:10]
+                        sig = r["wyckoff_sig"]
+                        sc = r["wyckoff_score"]
+                        pe = f"{r['pe']:.1f}" if r.get("pe") else "-"
+                        roe = f"{r['roe']:.1f}%" if r.get("roe") else "-"
+                        detail = r.get("wyckoff_detail", "")[:24]
+                        print(f"  {sig:<12} {sym:<8} {name:<7} {ind:<12} {sc:<5} {pe:<7} {roe:<6} {detail:<24}")
+                    print()
+
+                # 无明确信号的质地通过票
+                neutral = [r for r in enriched if r not in buy_sigs and r not in sell_sigs]
+                if neutral:
+                    print(f"  【其他质地通过】（无威科夫信号或信号不明）:")
+                    print("  ", ", ".join(f"{r['name']}({r['code'].split('.')[1]})" for r in neutral[:5]))
+                    print()
             else:
-                # 有信号但无质地通过的：展示质量失败原因
                 print(f"  【威科夫信号 {len(valid)}只，但均未通过个股质地检查】")
                 for r in valid[:5]:
                     q = r.get("quality", {})
                     fails = [k for k, v in q.items() if v == False]
                     print(f"  {r['name']:<6} {r['code']:<12} 排除: {','.join(fails)}")
-            print()
-            print()
+                print()
+
+        # === 今日小结 ===
+        buys = [r for r in self.results if r["wyckoff_sig"] in ("Spring","SOS","LPS","弱Spring") and r.get("quality_passed") == True]
+        sells = [r for r in self.results if r["wyckoff_sig"] == "Upthrust" and r.get("quality_passed") == True]
+        total_sig = len([r for r in self.results if r["wyckoff_sig"] not in ("-","无信号","数据不足")])
+        # 形态信号统计
+        pattern_count = len([r for r in self.results if r.get("pattern_name", "-") != "-"])
+        pattern_confirmed = len([r for r in self.results if r.get("_all_patterns") and any(p[3] for p in r["_all_patterns"])])
+        print(f"  【今日小结】")
+        notes = []
+        if breadth:
+            if breadth.get("ad_ratio", 0) >= 2:
+                notes.append(f"普涨格局，但")
+            elif breadth.get("ad_ratio", 0) >= 1.2:
+                notes.append(f"涨多跌少，但")
+        if total_sell > total_buy * 2:
+            notes.append(f"卖出信号(Upthrust {len(sells)}只)远超买入信号({len(buys)}只)，不宜追高")
+        elif buys:
+            notes.append(f"买入信号{len(buys)}只，可关注")
+        else:
+            notes.append(f"当前无质地通过的买入信号")
+
+        if pattern_count:
+            notes.append(f"形态信号{pattern_count}只(确认{pattern_confirmed})")
+
+        if concentration > 50:
+            notes.append(f"板块高度集中在{top_sector}，注意轮动风险")
+
+        # 建议
+        action_suggest = ""
+        if buys and total_sell <= total_buy * 2:
+            action_suggest = "轻仓试探买入信号标的，设好止损"
+        elif total_sell > total_buy * 2:
+            action_suggest = "减仓为主，不开新仓"
+        else:
+            action_suggest = "等待Spring/SOS出现再动手"
+        notes.append(f"建议: {action_suggest}")
+        print(f"  {'| '.join(notes)}")
+        print()
 
         # === 概念板块热度 ===
         try:
@@ -1372,11 +1704,165 @@ class Scanner:
                 print(f"  {'板块':<20} {'涨跌幅':<8}")
                 print(f"  " + "-" * 30)
                 for name, pct in concepts:
-                    arr = "↑" if pct > 0 else "↓"
-                    print(f"  {name:<20} {arr} {abs(pct):+.2f}%")
+                    arrow_f = "+" if pct > 0 else ""
+                    print(f"  {name:<20} {arrow_f}{pct:+.2f}%")
                 print()
         except Exception:
             pass
+
+        # === 热度增长率（概念2） ===
+        if _BUZZ_TOOL:
+            try:
+                overheat_list = scan_overheat(20)
+                if overheat_list:
+                    print(f"  【热度监控】")
+                    print(f"  {'名称':<10} {'排名':<6} {'综合分':<8} {'涨幅':<8} {'状态':<10}")
+                    print(f"  " + "-" * 45)
+                    for s in overheat_list[:8]:
+                        arrow_f = "+" if s['pct_chg'] > 0 else ""
+                        print(f"  {s['name']:<10} #{s['rank']:<4} {s['score']:<8.0f} {arrow_f}{s['pct_chg']:+.2f}%{'':<5} {s['alert']:<10}")
+                    print()
+            except Exception:
+                pass
+
+        # === 3σ 情绪过热（概念3） ===
+        if _SENTIMENT_TOOL:
+            try:
+                s = get_sentiment()
+                oh = s.get("overheat", [])
+                if oh:
+                    print(f"  【3σ 情绪异常】")
+                    for o in oh:
+                        print(f"  {o['name']}: {o['status']} — {o['detail']}")
+                    print()
+            except Exception:
+                pass
+
+    # ==================== 飞书推送 ====================
+
+    def _push_feishu(self, d, w, m):
+        """扫描完成后推送飞书卡片"""
+        cfg = get_scanner_config()
+        webhook_url = cfg.get("notify", {}).get("webhook_url", "")
+        if not webhook_url:
+            return
+
+        c_score = d["score"] * 0.4 + w["score"] * 0.3 + m["score"] * 0.3
+        combined_level = "黄"
+        if c_score >= 70:
+            combined_level = "红"
+        elif c_score < 40:
+            combined_level = "绿"
+        header_temp = "red" if combined_level == "红" else ("yellow" if combined_level == "黄" else "blue")
+        header_title = f"扫描报告 | 综合{round(c_score)}[{combined_level}]"
+
+        elements = []
+
+        # 三层情绪
+        mom_icon = {"升温": "↗", "降温": "↘", "持平": "→"}.get(w.get("momentum", ""), "")
+        d_line = " | ".join(f"{i['name']}{i['value']}{i['level']}" for i in d["items"])
+        w_line = f"周频{w['score']}分 {mom_icon}Δ{w['delta']:+d}" if w.get("delta") is not None else f"周频{w['score']}分"
+        m_line = " | ".join(f"{i['name']}{i['value']}{i['level']}" for i in m["items"])
+        elements.append(make_div(f"**日频** {d['score']}分  {d_line}"))
+        elements.append(make_note(f"{w_line}  |  **月频** {m['score']}分  {m_line}"))
+        elements.append(make_hr())
+
+        # 大盘状况
+        from market import MarketAnalyzer
+        try:
+            indices = MarketAnalyzer.fetch_indices()
+            idx_line = " | ".join(f"{n[:6]}{i['change_pct']:+.2f}%" for n, i in indices.items())
+            if idx_line:
+                elements.append(make_div(f"**大盘**  {idx_line}"))
+        except Exception:
+            pass
+
+        try:
+            brd = MarketAnalyzer.calc_breadth()
+            if brd:
+                ad = brd.get("ad_ratio", 0)
+                label = "普涨" if ad >= 2 else ("偏强" if ad >= 1.2 else "偏弱")
+                elements.append(make_note(f"涨跌{brd.get('up',0)}/{brd.get('down',0)}  涨停{brd.get('limit_up',0)}  跌停{brd.get('limit_down',0)}  |  {label}"))
+        except Exception:
+            pass
+        elements.append(make_hr())
+
+        # 信号精选
+        valid = [r for r in self.results if r["wyckoff_sig"] not in ("-", "无信号", "数据不足", "无数据")]
+        signals = [r for r in valid if r.get("quality_passed") == True]
+        if signals:
+            elements.append(make_div(f"**信号精选** ({len(signals)}只质地通过)"))
+            for r in signals[:_MAX_PUSH_N]:
+                sym = r["code"].split(".")[1] if "." in r["code"] else r["code"]
+                sig = r["wyckoff_sig"]
+                sc = r["wyckoff_score"]
+                elements.append(make_note(f"{sym} {r['name'][:6]}  {sig}({sc})  {r.get('industry','')[:8]}"))
+            if len(signals) > _MAX_PUSH_N:
+                elements.append(make_note(f"... 共{len(signals)}只信号"))
+            elements.append(make_hr())
+
+        # 板块集中度
+        sectors = {}
+        for r in self.results:
+            ind = r.get("industry", "其他")
+            sectors[ind] = sectors.get(ind, 0) + 1
+        sorted_sec = sorted(sectors.items(), key=lambda x: -x[1])
+        if sorted_sec:
+            top_sec = sorted_sec[0]
+            conc = top_sec[1] / len(self.results) * 100
+            sec_str = f"**板块** {top_sec[0]} {top_sec[1]}只({conc:.0f}%)"
+            if len(sorted_sec) > 1:
+                sec_str += f"  次热{sorted_sec[1][0]}{sorted_sec[1][1]}只"
+            elements.append(make_div(sec_str))
+
+        # 3σ 情绪异常
+        oh = d.get("overheat", [])
+        if oh:
+            oh_str = "  ".join(f"{o['name']}⚠{o['status']}" for o in oh[:3])
+            if oh_str:
+                elements.append(make_note(f"⚠ 3σ异常 {oh_str}"))
+
+        # 热度预警（概念2）
+        if _BUZZ_TOOL:
+            try:
+                buzz_alerts = scan_overheat(20)
+                if buzz_alerts:
+                    alert_str = "  ".join(f"{a['name']}{a['alert']}" for a in buzz_alerts[:3])
+                    elements.append(make_note(f"🔥 {alert_str}"))
+            except Exception:
+                pass
+
+        if hasattr(self, "watchlist_results"):
+            holdings = self.watchlist_results.get("holdings", [])
+            if holdings:
+                h_items = []
+                for s in holdings:
+                    pnl = f"{s['pnl_pct']:+.1f}%" if s.get("pnl_pct") is not None else "-"
+                    sug = ""
+                    if s["trend"] == "空头":
+                        sug = "止损"
+                    elif s["wyckoff_sig"] in ("Upthrust",) and s.get("pnl_pct", 0) is not None and s["pnl_pct"] > 5:
+                        sug = "减仓"
+                    h_items.append(f"{s['name'][:6]} {pnl}" + (f"({sug})" if sug else ""))
+                if h_items:
+                    elements.append(make_note("**持仓** " + " | ".join(h_items)))
+
+        # 小结
+        buys = len([r for r in signals if r["wyckoff_sig"] in ("Spring", "SOS", "LPS", "弱Spring")])
+        sells = len([r for r in signals if r["wyckoff_sig"] == "Upthrust"])
+        parts = []
+        if buys:
+            parts.append(f"买入{buys}只")
+        if sells:
+            parts.append(f"卖出{sells}只")
+        if buys > sells:
+            parts.append("偏多")
+        elif sells > buys:
+            parts.append("偏空")
+        if parts:
+            elements.append(make_note(" | ".join(parts)))
+
+        send_card(webhook_url, header_title, elements)
 
     # ==================== 主流程 ====================
 
@@ -1430,6 +1916,31 @@ class Scanner:
             self.analyze_watchlist()
 
         self.print_report(top_n)
+
+        # 推送飞书卡片
+        if _SENTIMENT_TOOL:
+            try:
+                from sentiment_indicator import get_daily_sentiment, get_weekly_sentiment, get_monthly_sentiment
+                d = get_daily_sentiment()
+                w = get_weekly_sentiment()
+                m = get_monthly_sentiment()
+                self._push_feishu(d, w, m)
+            except Exception:
+                pass
+
+        # 保存今日扫描结果到推荐历史
+        if _REC_TRACKER and hasattr(self, "results") and self.results:
+            try:
+                from market import MarketAnalyzer
+                indices = MarketAnalyzer.fetch_indices()
+            except Exception:
+                indices = {}
+            # 提取推荐（质地通过+有信号）
+            valid = [r for r in self.results if r["wyckoff_sig"] not in ("-", "无信号", "数据不足", "无数据")]
+            recommendations = [r for r in valid if r.get("quality_passed") == True]
+            pool = self.watchlist_results.get("pool", []) if hasattr(self, "watchlist_results") else []
+            holdings = self.watchlist_results.get("holdings", []) if hasattr(self, "watchlist_results") else []
+            save_scan_result(self.results, pool, holdings, recommendations, indices, top_n)
 
 
 def run_scanner(min_amount=5e8, quick=False):

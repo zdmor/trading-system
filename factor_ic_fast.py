@@ -115,13 +115,17 @@ def calc_factors(df):
         mom = 50 + ret_5d * 3 + ret_20d * 1
         factors["动量"] = max(0, min(100, mom))
 
-        # 2. RSI评分（中性最好）
-        if 40 <= rsi <= 60: rsi_s = 70
-        elif rsi > 75: rsi_s = 25
-        elif rsi < 25: rsi_s = 25
-        elif rsi > 65: rsi_s = 40
-        elif rsi < 35: rsi_s = 40
-        else: rsi_s = 60
+        # 2. RSI评分（动量方向，高RSI=强势延续）
+        if rsi > 70:
+            rsi_s = 80
+        elif rsi > 60:
+            rsi_s = 70
+        elif 40 <= rsi <= 60:
+            rsi_s = 55
+        elif rsi >= 30:
+            rsi_s = 40
+        else:
+            rsi_s = 25
         factors["RSI"] = rsi_s
 
         # 3. K线形态
@@ -150,20 +154,19 @@ def calc_factors(df):
         if price_above_ma20: mscore += 10
         factors["均线"] = max(0, min(100, mscore))
 
-        # 6. 波动率（低波加分）
-        vol_score = 50
-        if vol_20 < 1.5: vol_score = 70
-        elif vol_20 > 4: vol_score = 30
-        factors["低波"] = max(0, min(100, vol_score))
+        # 6. 波动率（ATR% 适中波动加分）
+        atr_pct = atr / price * 100
+        if atr_pct < 1.0:
+            vol_score = 30   # 波幅太低，死水
+        elif atr_pct < 2.5:
+            vol_score = 75   # 适中波动，有空间
+        elif atr_pct < 4.5:
+            vol_score = 60   # 偏高波动
+        else:
+            vol_score = 35   # 过高波动，风险大
+        factors["波动"] = max(0, min(100, vol_score))
 
-        # 7. 盈亏比（基于ATR）
-        risk = atr * 3.0 / price * 100
-        reward = atr * 5.0 / price * 100
-        rr_ratio = reward / max(risk, 0.01)
-        rr_score = min(100, rr_ratio * 15)
-        factors["盈亏比"] = max(0, min(100, rr_score))
-
-        # 前向5日收益
+        # 7. 前向5日收益
         idx = len(df[mask])
         fwd_5d = (df.iloc[idx+5]["close"] / price - 1) * 100 if idx + 5 < len(df) else None
 

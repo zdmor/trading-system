@@ -1,0 +1,149 @@
+{
+  "dates": [
+    "2026-05-13",
+    "2026-05-14",
+    "2026-05-15",
+    "2026-05-18",
+    "2026-05-19",
+    "2026-05-20"
+  ],
+  "signals_by_date": {
+    "2026-05-13": {
+      "total_signals": 21,
+      "buy_signals": 3,
+      "top_picks": [
+        {
+          "code": "sz.000977",
+          "name": "浪潮信息",
+          "signal": "SOS",
+          "score": 66.2,
+          "price": 77.34
+        },
+        {
+          "code": "sh.603005",
+          "name": "晶方科技",
+          "signal": "SOS",
+          "score": 62.7,
+          "price": 33.54
+        },
+        {
+          "code": "sh.600584",
+          "name": "长电科技",
+          "signal": "SOS",
+          "score": 62.400000000000006,
+          "price": 57.49
+        }
+      ]
+    },
+    "2026-05-14": {
+      "total_signals": 17,
+      "buy_signals": 0,
+      "top_picks": []
+    },
+    "2026-05-15": {
+      "total_signals": 9,
+      "buy_signals": 1,
+      "top_picks": [
+        {
+          "code": "sh.600584",
+          "name": "长电科技",
+          "signal": "SOS",
+          "score": 63.0,
+          "price": 58.05
+        }
+      ]
+    },
+    "2026-05-18": {
+      "total_signals": 12,
+      "buy_signals": 0,
+      "top_picks": []
+    },
+    "2026-05-19": {
+      "total_signals": 13,
+      "buy_signals": 5,
+      "top_picks": [
+        {
+          "code": "sz.002185",
+          "name": "华天科技",
+          "signal": "SOS",
+          "score": 62.9,
+          "price": 15.3
+        },
+        {
+          "code": "sz.000938",
+          "name": "紫光股份",
+          "signal": "SOS",
+          "score": 62.0,
+          "price": 32.49
+        },
+        {
+          "code": "sz.000977",
+          "name": "浪潮信息",
+          "signal": "SOS",
+          "score": 59.9,
+          "price": 72.19
+        },
+        {
+          "code": "sh.600584",
+          "name": "长电科技",
+          "signal": "SOS",
+          "score": 58.2,
+          "price": 60.81
+        },
+        {
+          "code": "sz.000066",
+          "name": "中国长城",
+          "signal": "SOS",
+          "score": 56.4,
+          "price": 20.72
+        }
+      ]
+    },
+    "2026-05-20": {
+      "total_signals": 12,
+      "buy_signals": 5,
+      "top_picks": [
+        {
+          "code": "sh.603005",
+          "name": "晶方科技",
+          "signal": "SOS",
+          "score": 70.1,
+          "price": 36.8
+        },
+        {
+          "code": "sz.002185",
+          "name": "华天科技",
+          "signal": "SOS",
+          "score": 59.4,
+          "price": 15.88
+        },
+        {
+          "code": "sz.002463",
+          "name": "沪电股份",
+          "signal": "Spring",
+          "score": 54.6,
+          "price": 103.58
+        },
+        {
+          "code": "sh.600584",
+          "name": "长电科技",
+          "signal": "SOS",
+          "score": 51.2,
+          "price": 66.22
+        },
+        {
+          "code": "sh.688498",
+          "name": "源杰科技",
+          "signal": "Spring",
+          "score": 48.8,
+          "price": 1114.94
+        }
+      ]
+    }
+  },
+  "summary": {
+    "total_buy_signals": 4,
+    "win_rate": 75.0,
+    "avg_2d_return": 5.18
+  }
+}
