@@ -20,9 +20,9 @@
     "avg_loss": 2.5
   },
   "sector": {
-    "win_rate": 0.37,
+    "win_rate": 0.5,
     "avg_win": 2.8,
-    "avg_loss": 3.0
+    "avg_loss": 2.8
   },
   "relative_strength": {
     "win_rate": 0.51,

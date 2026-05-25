@@ -67,14 +67,14 @@ _SECTOR_BOARD_CACHE = {'data': [], 'time': 0.0}
 _SECTOR_CACHE_TTL = 3600
 
 WEIGHTS = {
-    "tech_strength": 0.28,       # 威科夫+趋势动量合并 (原20+15=35→折合28，消除共线冗余)
-    "risk_reward": 0.18,         # 盈亏比 (16→18)
-    "volume": 0.15,              # 量比动量 (9→15，百分位改进后信号质量提升)
+    "tech_strength": 0.33,       # 威科夫+趋势动量合并 (原28→33，吸收了sector的权重)
+    "risk_reward": 0.22,         # 盈亏比 (原18→22)
+    "volume": 0.18,              # 量比动量 (原15→18)
     "candlestick": 0.05,         # K线形态 (不变)
-    "sector": 0.16,              # 板块强度 (11→16，吃掉大盘的部分权重)
-    "relative_strength": 0.18,   # 相对强度 (12→18)
+    "relative_strength": 0.22,   # 相对强度 (原18→22)
 }
-# 大盘趋势不再参与个股评分，移到 position_matrix.py 做仓位门槛
+# sector 因子从评分权重中移除（IC=-0.032 负预测能力），降级为仓位约束。
+# 大盘趋势不参与个股评分，在 position_matrix.py 做仓位门槛。
 
 # 评分 → 操作映射
 SCORE_LEVELS = [
@@ -950,6 +950,13 @@ class StockScorer:
                     pos_factor = min(pos_factor, 0.5)
             except Exception:
                 pass
+
+        # sector 约束：板块强度弱时降仓位（sector 已从评分权重移除）
+        sector_score = factors.get("sector", {}).get("score", 50)
+        if sector_score < 30:
+            pos_factor *= 0.5
+        elif sector_score < 40:
+            pos_factor *= 0.75
 
         return {
             "composite_score": composite,

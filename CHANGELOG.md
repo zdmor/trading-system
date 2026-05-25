@@ -5,6 +5,14 @@
 
 ---
 
+## v1.6.2-sectorfix (2026-05-26)
+- 重构: sector 从评分因子降级为仓位约束（IC=-0.032 负预测能力）
+- 修改: WEIGHTS 重分配 tech_strength 33% / risk_reward 22% / volume 18% / candlestick 5% / relative_strength 22%
+- 新增: sector 约束 — 板块评分<40 仓位×0.75, <30 仓位×0.5
+- 同步: BASE_WEIGHTS / FACTOR_STATS 一致更新
+
+---
+
 ## v1.6.1-factorstats (2026-05-26)
 - 修改: kelly_position.py FACTOR_STATS 基于 IC 回测数据更新
 - 更新: tech_strength 0.55→0.56, risk_reward 0.58→0.39, volume 0.53→0.41

@@ -18,12 +18,11 @@ from collections import defaultdict
 
 # 基础权重（P1-4 六因子架构，合计 1.0）
 BASE_WEIGHTS = {
-    "tech_strength": 0.28,
-    "risk_reward": 0.18,
-    "volume": 0.15,
+    "tech_strength": 0.33,
+    "risk_reward": 0.22,
+    "volume": 0.18,
     "candlestick": 0.05,
-    "sector": 0.16,
-    "relative_strength": 0.18,
+    "relative_strength": 0.22,
 }
 
 # 调节参数

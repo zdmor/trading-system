@@ -26,7 +26,7 @@ FACTOR_STATS = {
     "risk_reward":     {"win_rate": 0.39, "avg_win": 3.5, "avg_loss": 3.5},
     "volume":          {"win_rate": 0.41, "avg_win": 3.0, "avg_loss": 3.2},
     "candlestick":     {"win_rate": 0.51, "avg_win": 2.5, "avg_loss": 2.5},
-    "sector":          {"win_rate": 0.37, "avg_win": 2.8, "avg_loss": 3.0},
+    "sector":          {"win_rate": 0.50, "avg_win": 2.8, "avg_loss": 2.8},  # 移出评分权重，仅做仓位约束
     "relative_strength": {"win_rate": 0.51, "avg_win": 3.3, "avg_loss": 3.0},
 }
 
