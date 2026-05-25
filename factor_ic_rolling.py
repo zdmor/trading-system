@@ -383,6 +383,20 @@ def run_rolling_ic(top_n=200, windows=None, shift=5):
     print(f"  {'+'.join(core):<8} IC={np.mean(comb_arr):>+7.4f} ±{np.std(comb_arr):.4f}  IR={np.mean(comb_arr)/max(np.std(comb_arr),0.001):>+5.1f}  胜率{np.mean(comb_arr>0)*100:.0f}%")
 
     print(f"\n  总耗时: {time.time()-t0:.0f}s")
+    # 保存IC结果到动态权重系统
+    try:
+        from factor_weights import update_ic_cache
+        ic_data = {}
+        for r in results:
+            ic_data[r["factor"]] = {
+                "ic": round(r["mean_ic"], 4),
+                "icir": round(r["icir"], 2),
+                "win_rate": round(r["win_rate"] / 100, 4),
+            }
+        update_ic_cache(ic_data)
+    except Exception:
+        pass
+
 
 
 if __name__ == "__main__":

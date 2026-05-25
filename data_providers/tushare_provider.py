@@ -28,7 +28,7 @@ def _get_pro():
         cfg_path = os.path.join(os.path.dirname(__file__), '..', 'config.json')
         token = ''
         try:
-            with open(cfg_path) as f:
+            with open(cfg_path, encoding='utf-8') as f:
                 cfg = json.load(f)
             token = cfg.get('_tushare', {}).get('token', '')
         except Exception:

@@ -27,6 +27,13 @@ try:
 except ImportError:
     _RESEARCH_TRACKER_OK = False
 
+# Kelly 仓位模块
+try:
+    from kelly_position import compute_kelly_position
+    _KELLY_OK = True
+except ImportError:
+    _KELLY_OK = False
+
 
 try:
     from buzz_monitor import get_stock_buzz
@@ -39,16 +46,22 @@ try:
     _VOL_MOMENTUM = True
 except ImportError:
     _VOL_MOMENTUM = False
+
+try:
+    from factor_weights import get_weights as _get_dynamic_weights
+    _DYNAMIC_WEIGHTS_OK = True
+except ImportError:
+    _DYNAMIC_WEIGHTS_OK = False
+
 WEIGHTS = {
-    "wyckoff": 0.20,
-    "risk_reward": 0.16,
-    "volume": 0.09,
-    "candlestick": 0.05,
-    "sector": 0.11,
-    "momentum": 0.15,
-    "market": 0.12,
-    "relative_strength": 0.12,
+    "tech_strength": 0.28,       # 威科夫+趋势动量合并 (原20+15=35→折合28，消除共线冗余)
+    "risk_reward": 0.18,         # 盈亏比 (16→18)
+    "volume": 0.15,              # 量比动量 (9→15，百分位改进后信号质量提升)
+    "candlestick": 0.05,         # K线形态 (不变)
+    "sector": 0.16,              # 板块强度 (11→16，吃掉大盘的部分权重)
+    "relative_strength": 0.18,   # 相对强度 (12→18)
 }
+# 大盘趋势不再参与个股评分，移到 position_matrix.py 做仓位门槛
 
 # 评分 → 操作映射
 SCORE_LEVELS = [
@@ -186,6 +199,30 @@ class StockScorer:
             "raw": best_sig, "raw_score": best_raw_score,
         }
 
+    # ─────────────────────── 因子: 技术强势 (Wyckoff+趋势动量合并) ───────────────────────
+
+    def score_tech_strength(self):
+        """技术强势评分 (权重28%)
+        P0-3 证明 Wyckoff 与趋势动量 ρ=0.73 高度共线，合并为一个因子。
+        取两者等权平均，消除冗余但保留各自的信息增量。
+        """
+        w = self.score_wyckoff()
+        m = self.score_momentum()
+
+        combo_score = round((w["score"] + m["score"]) / 2)
+        combo_label = self._label(combo_score)
+        combo_detail = f"W:{w['score']}({w.get('raw','-')}) M:{m['score']}({m.get('rsi',50)})"
+
+        return {
+            "score": combo_score,
+            "label": combo_label,
+            "detail": combo_detail,
+            "wyckoff_score": w["score"],
+            "wyckoff_raw": w.get("raw", ""),
+            "momentum_score": m["score"],
+            "momentum_rsi": m.get("rsi", 50),
+        }
+
     # ─────────────────────── 因子2: 盈亏比 ───────────────────────
 
     def score_risk_reward(self):
@@ -235,7 +272,7 @@ class StockScorer:
     # ─────────────────────── 因子3: 量能分析（量比动量系统） ───────────────────────
 
     def score_volume(self):
-        """量比动量评分 (权重9%)
+        """量比动量评分 (权重15%)
         基于 VolumeMomentum 的量比均线+斜率+综合评分
         """
         try:
@@ -731,13 +768,11 @@ class StockScorer:
 
         # 逐个计算，每个失败都降级为50分
         for key, method in [
-            ("wyckoff", self.score_wyckoff),
+            ("tech_strength", self.score_tech_strength),
             ("risk_reward", self.score_risk_reward),
             ("volume", self.score_volume),
             ("candlestick", self.score_candlestick),
             ("sector", self.score_sector),
-            ("momentum", self.score_momentum),
-            ("market", self.score_market),
             ("relative_strength", self.score_relative_strength),
         ]:
             try:
@@ -745,10 +780,17 @@ class StockScorer:
             except Exception as e:
                 factors[key] = {"score": 50, "label": "中", "detail": f"计算异常: {e}"}
 
-        # 加权综合
+        # 大盘评分（不参与加权，只给仓位矩阵用）
+        try:
+            factors["market"] = self.score_market()
+        except Exception:
+            factors["market"] = {"score": 50, "label": "中", "detail": "计算异常"}
+
+        # 加权综合（动态权重：ICIR调整，无IC数据时回退固定权重）
+        _weights = _get_dynamic_weights() if _DYNAMIC_WEIGHTS_OK else WEIGHTS
         composite = 0.0
         breakdown_lines = []
-        for key, weight in WEIGHTS.items():
+        for key, weight in _weights.items():
             f = factors[key]
             contribution = f["score"] * weight
             composite += contribution
@@ -770,7 +812,7 @@ class StockScorer:
             try:
                 research_bonus = ResearchTracker.get_score_bonus(self.symbol)
                 if research_bonus:
-                    bonus_factor = next((f for f in breakdown_lines if f["key"] == "wyckoff"), None)
+                    bonus_factor = next((f for f in breakdown_lines if f["key"] == "tech_strength"), None)
                     if bonus_factor:
                         composite += research_bonus
                         breakdown_lines.append({
@@ -782,19 +824,33 @@ class StockScorer:
             except Exception:
                 pass
 
-        action, pos_factor = score_to_level(composite)
+        action, _legacy_factor = score_to_level(composite)
 
-        # 仓位决策矩阵（可选）: 综合大盘评分和板块热度
+        # ── Kelly 仓位计算 (优先) ──
+        pos_factor = 0.0
+        kelly_detail = ""
+        if _KELLY_OK:
+            try:
+                market_score = factors.get("market", {}).get("score", 50)
+                sector_score = factors.get("sector", {}).get("heat_score",
+                                  factors.get("sector", {}).get("score", 50))
+                kelly_result = compute_kelly_position(
+                    composite, breakdown_lines, market_score, sector_score
+                )
+                pos_factor = kelly_result["position_factor"]
+                kelly_detail = kelly_result["detail"]
+            except Exception:
+                # Kelly 失败回退到旧映射
+                _, pos_factor = score_to_level(composite)
+
+        # 仓位决策矩阵（最终约束层）
         if _POSITION_MATRIX_OK:
             try:
                 market_score = factors.get("market", {}).get("score", 50)
-                sector_score = factors.get("sector", {}).get("heat_score", factors.get("sector", {}).get("score", 50))
+                sector_score = factors.get("sector", {}).get("heat_score",
+                                  factors.get("sector", {}).get("score", 50))
                 matrix_factor = get_position_factor(market_score, sector_score)
-                # 矩阵结果与原始pos_factor取平均，既保留分数映射，又引入大盘×板块约束
-                if matrix_factor >= 0 and pos_factor >= 0:
-                    pos_factor = round((pos_factor + matrix_factor) / 2, 2)
-                elif matrix_factor >= 0:
-                    pos_factor = matrix_factor
+                pos_factor = min(pos_factor, matrix_factor)
                 pos_factor = max(0.0, min(1.0, pos_factor))
             except Exception:
                 pass
@@ -802,7 +858,8 @@ class StockScorer:
         return {
             "composite_score": composite,
             "action": action,
-            "pos_factor": pos_factor,
+            "pos_factor": round(pos_factor, 4),
             "factors": breakdown_lines,
             "level": self._label(composite),
+            "kelly_detail": kelly_detail,
         }
