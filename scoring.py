@@ -67,15 +67,29 @@ _SECTOR_BOARD_CACHE = {'data': [], 'time': 0.0}
 _SECTOR_CACHE_TTL = 3600
 
 WEIGHTS = {
-    "risk_reward": 0.40,           # 盈亏比 — 唯一全周期正 IC (+0.0636, ICIR 0.33)
-    "tech_strength": 0.20,         # 威科夫+趋势动量 — 牛市有效，全周期负 IC (-0.0285)
-    "relative_strength": 0.15,     # 相对强度 — 牛市有效，全周期负 IC (-0.0537)
-    "volume": 0.13,                # 量比动量 — 全周期负 IC (-0.0373)
-    "candlestick": 0.12,           # K线形态 — 全周期负 IC (-0.0487)
+    "risk_reward": 0.37,           # 盈亏比 — 唯一全周期正IC (+0.064, ICIR 0.33)
+    "tech_strength": 0.18,         # 威科夫+趋势动量 — 反转市有效(IC+0.022, 胜率58%)
+    "relative_strength": 0.14,     # 相对强度 — 反转市改善
+    "volume": 0.12,                # 量比动量 — 反转市IC+0.011, 胜率58%
+    "candlestick": 0.11,           # K线形态 — 反转市ICIR改善(-0.32→-0.09)
+    "volatility": 0.08,            # 波动率 — 全周期正IC(+0.051, ICIR+0.31)
 }
-# 权重基于 68 截面 IC 回测 (2026-05-26)。sector 因子从评分权重中移除（IC=-0.032），降级为仓位约束。
+# 权重基于 144 截面 × 1972 只股票 IC 回测 (2026-05-27)。
+# sector 因子从评分权重中移除（IC=-0.032），降级为仓位约束。
 # 大盘趋势不参与个股评分，在 position_matrix.py 做仓位门槛。
+#
+# 关键发现（2026-05-27 市态分组IC评估）：
+#   - 趋势市(52%截面)：全部因子IC为负，选股有效度低
+#   - 反转市(17%截面)：因子IC明显改善，动量IC+0.022、量能IC+0.011、互证IC+0.011
+#   - 反转市胜率全部>50%(动量58%/量能58%/均线58%)
+#   - 波动因子反转市IC最强(-0.095, ICIR=-0.32)，全周期正IC
+#   - 结论：因子是环境依赖型有效，反转市有效≠需降权
+#   - 修正：删除之前"反转市下调技术因子"的错误做法
+# 互证因子(多信号一致性)作为评分调节，不参与加权。
+# 质_动量内嵌在动量评分中做量价确认。
+# Δ因子(Δ动量/Δ量能/Δ均线): IC近零,不纳入评分。
 
+#
 # 评分 → 操作映射
 SCORE_LEVELS = [
     (80, "强加仓", 1.0),
@@ -128,6 +142,9 @@ def _apply_calibration(composite):
         return composite, ""
     except Exception:
         return composite, ""
+
+
+def score_to_level(composite_score):
     """综合分 → (操作标签, 仓位系数)"""
     for threshold, action, factor in SCORE_LEVELS:
         if composite_score >= threshold:
@@ -699,6 +716,29 @@ class StockScorer:
         elif atr_pct > 4.0:
             details.append(f"ATR%{atr_pct}% 偏高")
 
+        # 质_动量：量能验证趋势质量 — 趋势需要成交量确认才可信
+        try:
+            volumes = self.df["volume"].values.astype(float)
+            vol_ma20 = np.mean(volumes[-20:]) if len(volumes) >= 20 else np.mean(volumes)
+            vol_ratio = volumes[-1] / max(vol_ma20, 1)
+            vol_5 = np.mean(volumes[-5:]) if len(volumes) >= 5 else volumes[-1]
+            vol_prev5 = np.mean(volumes[-10:-5]) if len(volumes) >= 10 else 1
+            vol_trend = vol_5 / max(vol_prev5, 1)
+
+            # 多头趋势+放量=趋势确认(加码)，多头趋势+缩量=趋势存疑(减码)
+            if base > 55 and vol_ratio > 1.2 and vol_trend > 1.1:
+                base += 10
+                details.append(f"量比{vol_ratio:.1f}趋势{vol_trend:.2f}趋势确认 +10")
+            elif base > 55 and vol_ratio < 0.7:
+                base -= 8
+                details.append(f"缩量上涨(量比{vol_ratio:.1f}) -8")
+            # 空头趋势+放量=趋势确认向下
+            elif base < 35 and vol_ratio > 1.3:
+                base -= 8
+                details.append(f"放量下跌(量比{vol_ratio:.1f}) -8")
+        except Exception:
+            pass
+
         final = max(0, min(100, base))
         detail_str = " | ".join(details) if details else trend_dir
 
@@ -834,6 +874,136 @@ class StockScorer:
         except Exception:
             return {"score": 50, "label": "中", "detail": "计算异常"}
 
+    # ─────────────────────── 因子9: 波动率 ───────────────────────
+
+    def score_volatility(self):
+        """波动率评分 (权重8%)
+
+        全周期正IC(+0.051, ICIR+0.31)，反转市区分度最强(IC=-0.095, ICIR=-0.32)。
+        逻辑：低波动=筹码稳定有主力，高波动=情绪化交易=负期望。
+        """
+        try:
+            closes = self.df["close"].values.astype(float)
+            n = len(closes)
+            if n < 21:
+                return {"score": 50, "label": "中", "detail": "数据不足", "vol_pct": 0}
+        except Exception:
+            return {"score": 50, "label": "中", "detail": "数据不足", "vol_pct": 0}
+
+        # 20日收益率日波动率 → 年化
+        rets_daily = np.diff(closes[-21:]) / closes[-21:-1]
+        vol_annual = float(np.std(rets_daily) * np.sqrt(252))
+
+        # A股典型年化波动区间 15%-40%
+        if vol_annual <= 0.15:
+            score = 85
+        elif vol_annual <= 0.20:
+            score = 75
+        elif vol_annual <= 0.25:
+            score = 60
+        elif vol_annual <= 0.30:
+            score = 40
+        elif vol_annual <= 0.35:
+            score = 25
+        else:
+            score = 15
+
+        # ATR%微调
+        atr_pct = self.vol.get("atr_pct", 0)
+        if atr_pct < 1.5:
+            score = min(100, score + 5)
+        elif atr_pct > 5.0:
+            score = max(0, score - 10)
+
+        final = max(0, min(100, score))
+        return {
+            "score": final, "label": self._label(final),
+            "detail": f"年化波动{vol_annual:.1%} ATR%{atr_pct:.1f}%",
+            "vol_pct": round(vol_annual * 100, 1),
+        }
+
+    # ─────────────────────── 互证因子（多信号一致性调节）───────────────────────
+
+    def _calc_mutual_confirmation_bonus(self):
+        """计算互证因子调节分，返回 (bonus, info_dict)
+        bonus ∈ [-15, 15] 加到综合分，正值=多信号看涨一致，负值=多信号看跌一致
+
+        验证量价、趋势、RSI三组信号的方向一致性。
+        信号越一致，方向越可信，加分/减分幅度越大。
+        """
+        try:
+            closes = self.df["close"].values.astype(float)
+            volumes = self.df["volume"].values.astype(float)
+            n = len(closes)
+            if n < 20:
+                return 0, {}
+        except Exception:
+            return 0, {}
+
+        price = closes[-1]
+
+        # 量比
+        vol_ma20 = np.mean(volumes[-20:]) if n >= 20 else np.mean(volumes)
+        vol_ratio = volumes[-1] / max(vol_ma20, 1)
+
+        # 阴阳
+        is_up = closes[-1] >= self.df.iloc[-1]["open"]
+
+        # MA多头
+        ma20 = np.mean(closes[-20:]) if n >= 20 else price
+        ma50 = np.mean(closes[-50:]) if n >= 50 else price
+        ma200 = np.mean(closes[-200:]) if n >= 200 else price
+        ma_bull = ma20 > ma50 > ma200
+
+        # 5日收益
+        ret_5d = (closes[-1] / closes[-6] - 1) * 100 if n >= 6 else 0
+
+        # RSI
+        rsi = self._calc_rsi(closes)
+
+        consensus = 0
+        signals = []
+
+        # 1. 量价互证：放量+阳线=买盘真实，放量+阴线=卖压真实
+        if vol_ratio > 1.2 and is_up:
+            consensus += 1
+            signals.append("量价齐升")
+        elif vol_ratio > 1.2 and not is_up:
+            consensus -= 1
+            signals.append("放量下跌")
+
+        # 2. 趋势互证：MA多头+趋势向上 vs MA空头+趋势向下
+        if ma_bull and ret_5d > 0:
+            consensus += 1
+            signals.append("多头趋势")
+        elif not ma_bull and ret_5d < 0:
+            consensus -= 1
+            signals.append("空头趋势")
+
+        # 3. RSI方向：高RSI+涨=强势延续，低RSI+跌=弱势延续
+        if rsi > 60 and ret_5d > 0:
+            consensus += 1
+            signals.append("RSI强势")
+        elif rsi < 40 and ret_5d < 0:
+            consensus -= 1
+            signals.append("RSI弱势")
+
+        # consensus ∈ [-3, 3], 映射到 [-15, 15]
+        bonus = consensus * 5
+
+        if consensus >= 2:
+            tag = "强互证看涨"
+        elif consensus >= 1:
+            tag = "偏多互证"
+        elif consensus <= -2:
+            tag = "强互证看跌"
+        elif consensus <= -1:
+            tag = "偏空互证"
+        else:
+            tag = "信号中性"
+
+        return bonus, {"consensus": consensus, "tag": tag, "signals": signals}
+
     # ─────────────────────── 综合评分 ───────────────────────
 
     def compute(self):
@@ -848,6 +1018,7 @@ class StockScorer:
             ("candlestick", self.score_candlestick),
             ("sector", self.score_sector),
             ("relative_strength", self.score_relative_strength),
+            ("volatility", self.score_volatility),
         ]:
             try:
                 factors[key] = method()
@@ -864,6 +1035,7 @@ class StockScorer:
         composite = 0.0
         breakdown_lines = []
         active_weights = get_weights() if _DYNAMIC_WEIGHTS_OK else WEIGHTS
+
         for key, weight in active_weights.items():
             f = factors[key]
             contribution = f["score"] * weight
@@ -879,6 +1051,17 @@ class StockScorer:
             })
 
         composite = round(composite, 1)
+
+        # 互证因子调节（多信号一致性加分/减分）
+        mf_bonus, mf_info = self._calc_mutual_confirmation_bonus()
+        if mf_bonus:
+            composite = max(0, min(100, composite + mf_bonus))
+            breakdown_lines.append({
+                "key": "mutual_confirmation", "weight": 0, "score": mf_bonus,
+                "contribution": mf_bonus, "label": mf_info.get("tag", ""),
+                "detail": " | ".join(mf_info.get("signals", [])),
+                "weight_pct": 0,
+            })
 
         # 校准纠偏（基于历史评分准确率自动修正系统性偏差）
         calib_adjust, calib_note = _apply_calibration(composite)

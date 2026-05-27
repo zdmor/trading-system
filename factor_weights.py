@@ -16,17 +16,18 @@ from datetime import datetime, timedelta
 from typing import Optional
 from collections import defaultdict
 
-# 基础权重（基于 68 截面 IC 回测，合计 1.0）
+# 基础权重（基于 144 截面 × 1972 只 IC 回测，合计 1.0）
 # IC 正值越高权重越大，负 IC 因子保留低权重用于市态切换
-# risk_reward 唯一全周期正 IC (+0.0636)，权重最高
-# tech_strength/relative_strength 牛市有效，保留中等权重
-# volume/candlestick 全周期负 IC，保留低权重
+# risk_reward 唯一全周期正 IC (+0.064)，权重最高
+# volatility 全周期正 IC (+0.051, ICIR+0.31)，反转市区分度最强
+# tech_strength/relative_strength 反转市有效，保留中等权重
 BASE_WEIGHTS = {
-    "risk_reward": 0.40,
-    "tech_strength": 0.20,
-    "relative_strength": 0.15,
-    "volume": 0.13,
-    "candlestick": 0.12,
+    "risk_reward": 0.37,
+    "tech_strength": 0.18,
+    "relative_strength": 0.14,
+    "volume": 0.12,
+    "candlestick": 0.11,
+    "volatility": 0.08,
 }
 
 # 调节参数
@@ -155,7 +156,7 @@ def show_weight_report():
 # ─── 滚动 IC 数据库 + 时间衰减 ───
 
 _ROLLING_DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ic_rolling_db.json")
-_FACTOR_KEYS = ["tech_strength", "risk_reward", "volume", "candlestick", "sector", "relative_strength"]
+_FACTOR_KEYS = ["tech_strength", "risk_reward", "volume", "candlestick", "sector", "relative_strength", "volatility"]
 
 
 def _spearman_rank(x, y):
