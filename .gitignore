@@ -39,5 +39,21 @@ Thumbs.db
 
 # Environment
 .env
+.env.*
 .venv/
 venv/
+
+# Disabled / deprecated scripts
+*.DISABLED
+
+# Debug & temp scripts
+debug_*.py
+
+# Runtime bridge state
+.feishu_*.json
+feishu_bot_output.txt
+
+# Generated scan output
+scan_output.txt
+scanner_utf8_output.txt
+*_output.txt
