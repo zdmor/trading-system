@@ -19,6 +19,13 @@ from news_service import get_top_signal_news, format_news_block, get_market_news
 from notifier import push_report, send_serverchan, send_pushplus, send_card, make_div, make_hr, make_note
 from picks_tracker import append_history, generate_report
 
+# 基本面规则引擎（可选）
+try:
+    from fundamental_rules_engine import FundamentalRulesEngine, TushareDataFetcher
+    _FUND_RULES_OK = True
+except Exception:
+    _FUND_RULES_OK = False
+
 
 def analyze_stock(symbol, account_value=80000, position=None, market_health=None, pe_cap=None):
     """分析单只股票，返回 (report_text, name, price, op_panel, trade_data)"""
@@ -540,6 +547,39 @@ def run(watch_stocks=None, min_amount=5e8, top_n=15, max_scan=200):
         print(f"{'─'*62}")
         for alert in position_alerts:
             print(alert)
+
+    # ── 基本面规则引擎（书本规则评分）──
+    if _FUND_RULES_OK:
+        try:
+            engine = FundamentalRulesEngine()
+            fetcher = TushareDataFetcher()
+            print(f"\n{'─'*62}")
+            print(f"  基本面规则评分 (4本书60条规则)")
+            print(f"{'─'*62}")
+            for sym in watch_stocks:
+                label = sym
+                if sym == "002050": label = "三花智控"
+                elif sym == "600038": label = "中直股份"
+                elif sym == "600416": label = "湘电股份"
+                fund_data = fetcher.fetch_full_data(sym + ".SH" if sym.startswith("6") else sym + ".SZ")
+                if not fund_data or not fund_data.get("pe_ttm"):
+                    print(f"  {label}: 无基本面数据 (跳过)")
+                    continue
+                result = engine.analyze_stock(sym, fund_data)
+                score = result["score"]
+                flags = result["flags"]
+                fails = [f for f in flags if f["severity"] in ("fail", "veto")]
+                warns = [f for f in flags if f["severity"] == "warn"]
+                n_must = len(fails)
+                n_should = len(warns)
+                verdict = "通过" if result["verdict"] == "PASS" else "警告" if result["verdict"] == "WARN" else "否决"
+                detail_penalties = "; ".join(f['detail'][:40] for f in fails[:2])
+                print(f"  {label}: {score}分 [{verdict}] 违反规则{n_must}条")
+                if detail_penalties:
+                    print(f"    {detail_penalties}")
+            print(f"{'─'*62}")
+        except Exception as e:
+            print(f"  [基本面规则引擎跳过: {e}]")
 
     # ====== 5b. 股票池分析 ======
     POOL_FILE = os.path.join(os.path.dirname(__file__), "watchlist.json")

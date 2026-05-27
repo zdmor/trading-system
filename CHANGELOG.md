@@ -5,6 +5,15 @@
 
 ---
 
+## v1.7.0-icweight (2026-05-26)
+- 重构: 权重体系基于 68 截面 IC 回测重建 — risk_reward 升至 40% 主导
+- 修改: 新权重 risk_reward 40% / tech_strength 20% / relative_strength 15% / volume 13% / candlestick 12%
+- 修改: factor_weights K 0.3→0.5（增强 ICIR 动态调节幅度）
+- 更新: FACTOR_STATS win_rate 全因子基于 68 截面 IC 回测更新
+- 修复: 旧权重 tech_strength 33% 但 IC=-0.0285 负预测能力的倒挂
+
+---
+
 ## v1.6.2-sectorfix (2026-05-26)
 - 重构: sector 从评分因子降级为仓位约束（IC=-0.032 负预测能力）
 - 修改: WEIGHTS 重分配 tech_strength 33% / risk_reward 22% / volume 18% / candlestick 5% / relative_strength 22%

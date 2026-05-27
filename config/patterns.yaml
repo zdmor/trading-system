@@ -413,3 +413,40 @@ climax:
     lower_wick_bonus: 10
     # 上影线特征（购买高潮常见上影）
     upper_wick_bonus: 10
+
+# ============================================================
+# chan_third_buy 缠论第三类买点 — 执行层信号
+# 中枢突破后回踩不进入，提供入场时机
+# ============================================================
+chan_third_buy:
+  enabled: true
+  exclude_trends: ["空头", "错误"]
+  min_bars: 60
+
+  # 顶底分型窗口（各侧K线数）
+  fractal_window: 2
+
+  # 中枢形成后最多往后看多少K线找突破
+  max_breakout_lookback: 60
+
+  # 回踩时允许的最低低点与中枢上沿的最大距离（百分比）
+  max_retest_distance_pct: 5.0
+
+  scoring:
+    base_score: 60
+    # 回踩距离中枢上沿的程度（越小越好）
+    retest_categories:
+      - [1.0, 25, "精准回踩"]
+      - [3.0, 15, "近距回踩"]
+      - [999.0, 0, ""]
+    # 多头趋势加分
+    bull_trend_bonus: 10
+    # 突破时放量加分
+    breakout_volume_ratio: 1.5
+    breakout_volume_score: 10
+    # 回踩后回升确认加分
+    recovery_score: 10
+
+  thresholds:
+    strong_signal: 70
+    weak_label: "弱三买"

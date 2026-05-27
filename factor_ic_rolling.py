@@ -167,13 +167,127 @@ def calc_factors_at_idx(df, idx):
             vol_score = 35   # 过高波动，风险大
         factors["波动"] = max(0, min(100, vol_score))
 
-        # 7. 前向5日收益
-        if idx + 5 < len(df):
-            fwd_5d = (df.iloc[idx + 5]["close"] / price - 1) * 100
-        else:
-            fwd_5d = None
+        # ============ Δ因子（因子值5日变化，捕捉趋势加速度）============
+        if idx >= 5:
+            # Δ动量：动量加速度（当前动量 - 5天前动量）
+            def _delta_momentum(lookback=5):
+                if idx < lookback:
+                    return 50
+                prev_closes = closes[:idx - lookback + 1]
+                prev_volumes = volumes[:idx - lookback + 1]
+                if len(prev_closes) < 20:
+                    return 50
+                prev_price = prev_closes[-1]
+                ret_5d_prev = (prev_closes[-1] / prev_closes[-6] - 1) * 100 if len(prev_closes) >= 6 else 0
+                ret_20d_prev = (prev_closes[-1] / prev_closes[-21] - 1) * 100 if len(prev_closes) >= 21 else 0
+                mom_prev = 50 + ret_5d_prev * 3 + ret_20d_prev * 1
+                return max(0, min(100, mom_prev))
+            mom_delta = factors["动量"] - _delta_momentum()
+            factors["Δ动量"] = max(0, min(100, 50 + mom_delta * 0.5))
 
-        # 前向5日收益
+            # Δ量能：当前量比 vs 5天前量比
+            if idx >= 5 and n >= 25:
+                vol_ma20_prev = np.mean(volumes[-25:-5]) if n >= 25 else np.mean(volumes[:n-5])
+                vol_ratio_prev = volumes[-6] / max(vol_ma20_prev, 1)
+                # 当前量比在第5行已有
+                vr_delta = vol_ratio - vol_ratio_prev
+                factors["Δ量能"] = max(0, min(100, 50 + vr_delta * 15))
+            else:
+                factors["Δ量能"] = 50
+
+            # Δ均线：均线斜率变化
+            if n >= 25:
+                ma20_prev = np.mean(closes[-25:-5])
+                ma50_prev = np.mean(closes[-55:-5]) if n >= 55 else np.mean(closes[:n-5])
+                ma200_prev = np.mean(closes[-205:-5]) if n >= 205 else np.mean(closes[:n-5])
+                bull_prev = 1 if ma20_prev > ma50_prev > ma200_prev else 0
+                bull_delta = ma_bull - bull_prev  # -1, 0, or 1
+                factors["Δ均线"] = max(0, min(100, 50 + bull_delta * 35))
+            else:
+                factors["Δ均线"] = 50
+        else:
+            factors["Δ动量"] = 50
+            factors["Δ量能"] = 50
+            factors["Δ均线"] = 50
+
+        # ============ 因果质量评分 ============
+        # 量能因果质量：放量发生在正确位置（支撑位附近、MA多头中）→ 质量高
+        causal_vol = 50
+        if vol_ratio > 1.3:
+            if ma_bull and price > ma20:
+                causal_vol = 85   # 多头中放量 → 主动买盘
+            elif price < ma20 and ret_5d < -3:
+                causal_vol = 30   # 空头中放量下跌 → 恐慌
+            else:
+                causal_vol = 65
+        elif vol_ratio < 0.6:
+            if ma_bull and ret_5d > 0:
+                causal_vol = 70   # 多头缩量上涨 → 健康
+            else:
+                causal_vol = 40
+        factors["质_量能"] = causal_vol
+
+        # K线因果质量：K线形态与量价关系互证
+        causal_k = 50
+        last_bar = sdf.iloc[-1]
+        total_range_bar = last_bar["high"] - last_bar["low"]
+        body_ratio = body / max(total_range_bar, 0.01)
+        if is_up and body_ratio > 0.5:
+            if vol_ratio > 1.2:
+                causal_k = 85   # 阳线+放量 → 真实买盘
+            elif vol_ratio < 0.7:
+                causal_k = 40   # 阳线+缩量 → 买盘弱
+        elif not is_up and body_ratio > 0.5:
+            if vol_ratio > 1.3:
+                causal_k = 25   # 阴线+放量 → 真实卖压
+            else:
+                causal_k = 45
+        else:  # 小实体/十字星
+            if lower > body * 2 and vol_ratio < 0.8:
+                causal_k = 75   # 缩量锤子线 → 抛压枯竭
+            elif upper > body * 2 and vol_ratio > 1.3:
+                causal_k = 30   # 放量射击之星 → 供给出现
+        factors["质_形态"] = causal_k
+
+        # 动量因果质量：趋势+量能互证
+        causal_mom = 50
+        if ret_5d > 2 and ret_20d > 3:
+            if vol_trend > 1.1:
+                causal_mom = 85   # 趋势+放量 → 趋势确认
+            else:
+                causal_mom = 60
+        elif ret_5d < -2 and ret_20d < -3:
+            if vol_trend > 1.1:
+                causal_mom = 25   # 下跌+放量 → 趋势确认向下
+            else:
+                causal_mom = 40
+        elif -1 <= ret_5d <= 1:
+            if vol_ratio < 0.6 and price > ma20:
+                causal_mom = 70   # 缩量横盘在MA20上 → 蓄力
+            elif vol_ratio > 1.5 and price < ma20:
+                causal_mom = 30   # 放量滞跌(可能有吸筹,需要时间)
+        factors["质_动量"] = causal_mom
+
+        # ============ 互证因子（多信号一致性）============
+        consensus = 0
+        # 量价互证：放量+阳线=1分，缩量+阴线=-1分
+        if vol_ratio > 1.2 and is_up:
+            consensus += 1
+        elif vol_ratio > 1.2 and not is_up:
+            consensus -= 1
+        # 趋势互证：MA多头+动量向上
+        if ma_bull and ret_5d > 0:
+            consensus += 1
+        elif not ma_bull and ret_5d < 0:
+            consensus -= 1
+        # RSI方向
+        if rsi > 60 and ret_5d > 0:
+            consensus += 1
+        elif rsi < 40 and ret_5d < 0:
+            consensus -= 1
+        factors["互证"] = max(0, min(100, 50 + consensus * 16))
+
+        # 7. 前向5日收益
         if idx + 5 < len(df):
             fwd_5d = (df.iloc[idx + 5]["close"] / price - 1) * 100
         else:
@@ -184,9 +298,61 @@ def calc_factors_at_idx(df, idx):
         return None, None
 
 
+def ic_trend_analysis(ics, factor_name=""):
+    """
+    IC趋势衰减分析
+    返回: {slope, recent_mean, early_mean, change, alert, stability}
+    """
+    arr = np.array(ics)
+    n = len(arr)
+    if n < 10:
+        return {"slope": 0, "recent_mean": 0, "early_mean": 0,
+                "change": 0, "alert": "insufficient", "stability": 0}
+
+    # 线性回归斜率（IC随时间变化的方向和速度）
+    x = np.arange(n)
+    slope = np.polyfit(x, arr, 1)[0] * n  # 总变化幅度（从起点到终点）
+
+    # 近期 vs 早期
+    split = n // 2
+    early_mean = float(np.mean(arr[:split]))
+    recent_mean = float(np.mean(arr[split:]))
+    change = recent_mean - early_mean
+
+    # IC稳定性：滚动标准差趋势
+    window = min(20, n // 3)
+    rolling_std = np.array([np.std(arr[max(0, i-window):i+1]) for i in range(n)])
+    recent_vol = float(np.mean(rolling_std[-window:]))
+    early_vol = float(np.mean(rolling_std[:window])) if n >= window * 2 else recent_vol
+    stability = early_vol / max(recent_vol, 0.001)  # <1 = 波动在增大
+
+    # 警戒级别
+    if change < -0.03 and stability < 0.8:
+        alert = "decay"        # IC下降+波动增大=明确衰减
+    elif change < -0.02 or stability < 0.7:
+        alert = "watch"        # 需关注
+    else:
+        alert = "normal"
+
+    return {
+        "slope": round(slope, 4),
+        "recent_mean": round(recent_mean, 4),
+        "early_mean": round(early_mean, 4),
+        "change": round(change, 4),
+        "alert": alert,
+        "stability": round(stability, 2),
+    }
+
+
 def spearman_rank(x, y):
+    # 过滤 NaN
+    mask = ~(np.isnan(x) | np.isnan(y))
+    x, y = x[mask], y[mask]
     n = len(x)
     if n < 3:
+        return 0
+    # 检查常量序列
+    if np.std(x) < 1e-10 or np.std(y) < 1e-10:
         return 0
     rx = np.argsort(np.argsort(x))
     ry = np.argsort(np.argsort(y))
@@ -250,7 +416,10 @@ def run_rolling_ic(top_n=200, windows=None, shift=5):
     time_points = list(range(usable_start, usable_end, shift))
 
     factor_names = ["动量", "RSI", "K线", "量能", "均线", "波动"]
-    all_ics = {fn: [] for fn in factor_names}
+    delta_names = ["Δ动量", "Δ量能", "Δ均线"]
+    causal_names = ["质_量能", "质_形态", "质_动量", "互证"]
+    all_factor_names = factor_names + delta_names + causal_names
+    all_ics = {fn: [] for fn in all_factor_names}
     all_comp_ics = []
 
     total_tp = len(time_points)
@@ -276,10 +445,11 @@ def run_rolling_ic(top_n=200, windows=None, shift=5):
         # 窗口IC在这里是指用全部股票的截面计算IC
 
         # 单个因子IC
-        for fn in factor_names:
-            scores = np.array([f[fn] for f in all_factors])
-            ic = spearman_rank(scores, np.array(all_fwds))
-            all_ics[fn].append(ic)
+        for fn in all_factor_names:
+            if fn in all_factors[0]:
+                scores = np.array([f[fn] for f in all_factors])
+                ic = spearman_rank(scores, np.array(all_fwds))
+                all_ics[fn].append(ic)
 
         # 综合评分IC（等权平均）
         comp = np.array([np.mean(list(f.values())) for f in all_factors])
@@ -299,7 +469,7 @@ def run_rolling_ic(top_n=200, windows=None, shift=5):
 
     # 按 |均值IC| 排序
     results = []
-    for fn in factor_names:
+    for fn in all_factor_names:
         ics = np.array(all_ics[fn])
         mean_ic = np.mean(ics)
         std_ic = np.std(ics)
@@ -366,7 +536,35 @@ def run_rolling_ic(top_n=200, windows=None, shift=5):
                 cw = np.mean(seg_comp > 0) * 100
                 print(f"    {'综合平均':<8} IC={cm:>+7.4f} ±{cs:.4f}  IR={cir:>+5.1f}  胜率{cw:.0f}%")
 
-    # 6/7. RSI反转验证 + 核心组合
+    # 7. IC趋势衰减分析
+    print(f"\n{'=' * 100}")
+    print(f"  IC健康度 — 后半程IC vs 前半程 | slope=全周期趋势 | stability>1=波动收窄")
+    print(f"{'=' * 100}")
+    print(f"  {'因子':<8} {'近期IC':>8} {'早期IC':>8} {'变化':>8} {'slope':>8} {'稳定':>6}  {'状态'}")
+    print(f"  {'-' * 70}")
+
+    trends = {}
+    for r in sorted(results, key=lambda x: -abs(x["mean_ic"])):
+        fn = r["factor"]
+        ics_arr = all_ics[fn]
+        ta = ic_trend_analysis(ics_arr, fn)
+        trends[fn] = ta
+
+        alert_symbol = {"normal": "OK", "watch": "..", "decay": "!!", "insufficient": "--"}.get(ta["alert"], "??")
+        print(f"  {fn:<8} {ta['recent_mean']:>+8.4f} {ta['early_mean']:>+8.4f} {ta['change']:>+8.4f} {ta['slope']:>+8.4f} {ta['stability']:>5.1f}  {alert_symbol}")
+
+    comp_ta = ic_trend_analysis(comp_ics, "综合平均")
+    print(f"  {'-' * 70}")
+    print(f"  {'综合平均':<8} {comp_ta['recent_mean']:>+8.4f} {comp_ta['early_mean']:>+8.4f} {comp_ta['change']:>+8.4f} {comp_ta['slope']:>+8.4f} {comp_ta['stability']:>5.1f}  {'normal'}")
+
+    decay_factors = [fn for fn, ta in trends.items() if ta["alert"] == "decay"]
+    watch_factors = [fn for fn, ta in trends.items() if ta["alert"] == "watch"]
+    if decay_factors:
+        print(f"\n  !! 衰减风险: {', '.join(decay_factors)} — IC持续下降+波动增大, 考虑下调权重")
+    if watch_factors:
+        print(f"  .. 关注中: {', '.join(watch_factors)} — IC有走弱迹象")
+
+    # 8. RSI反转验证 + 核心组合
     print(f"\n  组合方案模拟:")
     print(f"  {'-' * 60}")
     ics = np.array(all_ics["RSI"])
@@ -383,15 +581,20 @@ def run_rolling_ic(top_n=200, windows=None, shift=5):
     print(f"  {'+'.join(core):<8} IC={np.mean(comb_arr):>+7.4f} ±{np.std(comb_arr):.4f}  IR={np.mean(comb_arr)/max(np.std(comb_arr),0.001):>+5.1f}  胜率{np.mean(comb_arr>0)*100:.0f}%")
 
     print(f"\n  总耗时: {time.time()-t0:.0f}s")
-    # 保存IC结果到动态权重系统
+    # 保存IC结果到动态权重系统（含趋势数据）
     try:
         from factor_weights import update_ic_cache
         ic_data = {}
         for r in results:
-            ic_data[r["factor"]] = {
+            fn = r["factor"]
+            ta = trends.get(fn, {})
+            ic_data[fn] = {
                 "ic": round(r["mean_ic"], 4),
                 "icir": round(r["icir"], 2),
                 "win_rate": round(r["win_rate"] / 100, 4),
+                "trend_change": ta.get("change", 0),
+                "trend_alert": ta.get("alert", "insufficient"),
+                "stability": ta.get("stability", 0),
             }
         update_ic_cache(ic_data)
     except Exception:

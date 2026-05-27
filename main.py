@@ -260,6 +260,8 @@ class Strategy:
             "atr_pct": round(self.latest["atr_pct"], 1),
             "lower_band": round(self.price - self.latest["atr"] * 2, 2),
             "upper_band": round(self.price + self.latest["atr"] * 2, 2),
+            "atr_stop_profit": round(self.price + self.latest["atr"] * 1.5, 2),
+            "atr_stop_profit_agg": round(self.price + self.latest["atr"] * 2.5, 2),
         }
 
     def position_plan(self, stop_price, risk_pct=0.02, entry_status=None, market_health=None, composite_score=None, pe_cap=None, sector_heat_score=None):
@@ -645,7 +647,7 @@ class Report:
             lines.append(f"  {c}")
         return "\n".join(lines)
 
-    def recommendation_section(self, trend, entry, stop_price, exit_prices, pos, current_price=None):
+    def recommendation_section(self, trend, entry, stop_price, exit_prices, pos, current_price=None, vol=None):
         """操作建议段落"""
         lines = [self._section("操作建议")]
         current_price = current_price or exit_prices[0] * 0.9 if exit_prices else 0
@@ -674,6 +676,9 @@ class Report:
                 lines.append(f"  [止盈一] {exit_prices[0]:.2f}")
             if len(exit_prices) > 1:
                 lines.append(f"  [止盈二] {exit_prices[1]:.2f}")
+            # ATR量化止盈位
+            if vol and vol.get("atr_stop_profit"):
+                lines.append(f"  [ATR止盈] 稳健 {vol['atr_stop_profit']:.2f} / 激进 {vol['atr_stop_profit_agg']:.2f}")
         else:
             lines.append("  当前为空头趋势，不宜做多")
 
@@ -944,7 +949,7 @@ def main():
             report.position_section(pos, current_price=price),
             report.signal_section(entry_check),
             report.scoring_section(scoring_result),
-            report.recommendation_section(trend, entry_check, stop_price, exit_prices, pos, current_price=price),
+            report.recommendation_section(trend, entry_check, stop_price, exit_prices, pos, current_price=price, vol=vol),
             report.footer(),
         ])
         print(output)

@@ -192,6 +192,22 @@ class WyckoffAnalyzer:
         bounce_cfg = scoring.get("bounce", [])
         nd_confirm = scoring.get("next_day_confirm", 15)
 
+        # ---- start_zone_check: 跌势起点位置（全局，循环外计算一次）-----
+        zone_bonus = 0
+        zone_label = ""
+        if len(closes) >= 11 and len(highs) >= 10:
+            start_price = float(closes[-11])   # 10日前收盘价 = 跌势起点
+            recent_10d_high = float(max(highs[-10:]))
+            zone_range = recent_10d_high - support
+            if zone_range > 0:
+                start_pct = (start_price - support) / zone_range * 100
+                if start_pct >= 30:
+                    zone_bonus = 5
+                    zone_label = f"起区{start_pct:.0f}%"
+                elif start_pct < 20:
+                    zone_bonus = -10
+                    zone_label = f"近撑{start_pct:.0f}%"
+
         best = None
         for i in range(len(lookback)):
             low = float(lookback[i])
@@ -215,6 +231,11 @@ class WyckoffAnalyzer:
                 if bounce >= b[0]: score += b[1]; parts.append(b[2].format(bounce=bounce)); break
             if i + 1 < len(closes_lb) and float(closes_lb[i+1]) > close:
                 score += nd_confirm; parts.append("确认")
+
+            # 叠加 start_zone 评分
+            if zone_bonus != 0:
+                score += zone_bonus
+                parts.append(zone_label)
 
             if score > (best[1] if best else 0):
                 sig = "Spring" if score >= thr.get("strong_signal", 55) else thr.get("weak_label", "弱Spring")
@@ -628,6 +649,171 @@ class WyckoffAnalyzer:
 
         return ("Markup", score, " | ".join(parts)) if score >= thr.get("min_score", 50) else None
 
+    # -------------------------------------------------------
+    # 缠论第三类买点 — 执行层信号
+    # -------------------------------------------------------
+    @classmethod
+    def detect_chan_third_buy(cls, closes, highs, lows, volumes, trend):
+        """
+        缠论第三类买点检测：中枢形成 → 突破上沿 → 回踩不进入
+
+        三买本质：
+        趋势已经确立（中枢形成 = 多空力量平衡已被打破），
+        第一次回踩不重新进入中枢 = 确认趋势延续的最佳入场点。
+        """
+        cfg = cls._cfg("chan_third_buy")
+        if not cfg.get("enabled", True) or trend in cfg.get("exclude_trends", ["空头", "错误"]):
+            return None
+        if len(closes) < cfg.get("min_bars", 60):
+            return None
+
+        n = len(closes)
+
+        # ---- 1. 顶底分型识别 ----
+        fw = cfg.get("fractal_window", 2)
+        tops = []    # [(index, high)]
+        bottoms = []  # [(index, low)]
+
+        for i in range(fw, n - fw):
+            # 顶分型：中间高 > 两侧各fw根
+            if all(highs[i] > highs[i - j - 1] for j in range(fw)) and \
+               all(highs[i] >= highs[i + j + 1] for j in range(fw)):
+                tops.append((i, highs[i]))
+            # 底分型：中间低 < 两侧各fw根
+            if all(lows[i] < lows[i - j - 1] for j in range(fw)) and \
+               all(lows[i] <= lows[i + j + 1] for j in range(fw)):
+                bottoms.append((i, lows[i]))
+
+        if len(tops) < 3 or len(bottoms) < 3:
+            return None
+
+        # ---- 2. 构建交替笔序列 ----
+        pts = []
+        ti, bi = 0, 0
+
+        # 谁先出现谁开头
+        if tops[0][0] < bottoms[0][0]:
+            pts.append(("top", tops[0][0], tops[0][1]))
+            ti = 1
+        else:
+            pts.append(("bottom", bottoms[0][0], bottoms[0][1]))
+            bi = 1
+
+        while ti < len(tops) and bi < len(bottoms):
+            last = pts[-1]
+            if last[0] == "top":
+                if bottoms[bi][0] > last[1]:
+                    pts.append(("bottom", bottoms[bi][0], bottoms[bi][1]))
+                bi += 1
+            else:
+                if tops[ti][0] > last[1]:
+                    pts.append(("top", tops[ti][0], tops[ti][1]))
+                ti += 1
+
+        # 需要至少6个点（3笔）才能构成中枢
+        if len(pts) < 6:
+            return None
+
+        # ---- 3. 寻找最近的中枢（3笔重叠区域） ----
+        max_ll = cfg.get("max_breakout_lookback", 60)
+        scoring = cfg.get("scoring", {})
+        thr = cfg.get("thresholds", {})
+        max_rt_dist = cfg.get("max_retest_distance_pct", 5.0)
+
+        # 从最近的潜在中枢开始搜索
+        for seg_start in range(len(pts) - 4, max(0, len(pts) - 10), -2):
+            if seg_start < 0 or seg_start + 4 > len(pts):
+                continue
+
+            p0, p1, p2, p3 = pts[seg_start:seg_start + 4]
+
+            # 三笔的价格区间
+            s1_h = max(highs[p0[1]:p1[1] + 1])
+            s1_l = min(lows[p0[1]:p1[1] + 1])
+            s2_h = max(highs[p1[1]:p2[1] + 1])
+            s2_l = min(lows[p1[1]:p2[1] + 1])
+            s3_h = max(highs[p2[1]:p3[1] + 1])
+            s3_l = min(lows[p2[1]:p3[1] + 1])
+
+            # 中枢重叠区间：三笔的max低点 < min高点（有交集）
+            pivot_top = min(s1_h, s2_h, s3_h)
+            pivot_bot = max(s1_l, s2_l, s3_l)
+
+            if pivot_bot >= pivot_top:
+                continue  # 无重叠，不是中枢
+
+            pivot_end_idx = p3[1]  # 中枢完成位置
+
+            # ---- 4. 突破检测 ----
+            breakout_idx = None
+            search_end = min(n, pivot_end_idx + max_ll)
+            for i in range(pivot_end_idx, search_end):
+                if highs[i] > pivot_top:
+                    breakout_idx = i
+                    break
+
+            if breakout_idx is None:
+                continue
+
+            # ---- 5. 回踩检测 ----
+            retest_low = None
+            retest_idx = None
+            max_allowed = pivot_top * (1 + max_rt_dist / 100)
+            min_allowed = pivot_top  # 不能回到中枢内
+
+            for i in range(breakout_idx, n):
+                l = lows[i]
+                if l > min_allowed:
+                    # 回踩到接近中枢上沿但没进去
+                    if l <= max_allowed:
+                        retest_low = l
+                        retest_idx = i
+                        break
+                else:
+                    # 重新进入中枢，信号失效
+                    break
+
+            if retest_low is None:
+                continue
+
+            # ---- 6. 评分 ----
+            rt_dist = (retest_low - pivot_top) / pivot_top * 100
+            score = scoring.get("base_score", 60)
+            parts = []
+
+            # 回踩质量
+            for r in scoring.get("retest_categories", []):
+                if rt_dist <= r[0]:
+                    score += r[1]
+                    if len(r) > 2 and r[2]:
+                        parts.append(r[2])
+                    break
+
+            # 多头趋势确认
+            if trend == "多头":
+                score += scoring.get("bull_trend_bonus", 10)
+                parts.append("多头趋势")
+
+            # 突破放量
+            if breakout_idx < len(volumes):
+                bk_vol = volumes[breakout_idx]
+                bg = closes[-20:-1] if n >= 20 else closes[:-1]
+                avg_vol = cls._avg(volumes[-min(20, len(volumes)-1):-1]) if n >= 5 else cls._avg(volumes)
+                if avg_vol > 0 and bk_vol > avg_vol * scoring.get("breakout_volume_ratio", 1.5):
+                    score += scoring.get("breakout_volume_score", 10)
+                    parts.append("放量突破")
+
+            # 回踩后回升确认
+            if closes[-1] > pivot_top and retest_idx < n - 1:
+                if closes[-1] > closes[retest_idx]:
+                    score += scoring.get("recovery_score", 10)
+                    parts.append("回升确认")
+
+            parts.append(f"三买{rt_dist:.1f}%")
+            sig = "三买" if score >= thr.get("strong_signal", 70) else thr.get("weak_label", "弱三买")
+            return (sig, score, " | ".join(parts))
+
+        return None
 
     # -------------------------------------------------------
     # Accumulation ABC 子阶段
@@ -1067,6 +1253,22 @@ class Scanner:
                     result["_all_patterns"] = [(p.name, p.score, p.direction,
                                                 p.confirmed, p.target) for p in patterns]
 
+            # 缠论三买执行信号
+            result["chan_third_buy"] = None
+            if len(closes) >= 60:
+                try:
+                    chan_sig = WyckoffAnalyzer.detect_chan_third_buy(
+                        closes, highs, lows, volumes, trend=result["trend"]
+                    )
+                    if chan_sig:
+                        result["chan_third_buy"] = {
+                            "signal": chan_sig[0],
+                            "score": chan_sig[1],
+                            "detail": chan_sig[2]
+                        }
+                except Exception:
+                    pass
+
         except Exception:
             pass
 
@@ -1161,11 +1363,17 @@ class Scanner:
             sys.stdout.write(f"\r  分析进度: {total}/{total}\n")
             sys.stdout.flush()
 
-        # 排序：威科夫信号得分 > 多头 > 成交额
+        # 排序：三买 > 威科夫信号得分 > 多头 > 成交额
         def sort_key(x):
-            ws = -x["wyckoff_score"]  # 高分在前
+            c3 = 0
+            cb = x.get("chan_third_buy")
+            if cb and cb["signal"] == "三买":
+                c3 = -100  # 三买优先展示
+            elif cb and cb["signal"] == "弱三买":
+                c3 = -50
+            ws = -x["wyckoff_score"]
             tr = 0 if x["trend"] == "多头" else 1
-            return (ws, tr, -x["amount"])
+            return (c3, ws, tr, -x["amount"])
 
         results.sort(key=sort_key)
         self.results = results
@@ -1255,10 +1463,14 @@ class Scanner:
 
         # 信号统计
         sig_counts = {}
+        c3_count = 0
         for r in self.results:
             t = r["wyckoff_sig"]
             if t not in ("-", "无信号", "数据不足"):
                 sig_counts[t] = sig_counts.get(t, 0) + 1
+            cb = r.get("chan_third_buy")
+            if cb and cb["signal"] == "三买":
+                c3_count += 1
 
         # 推荐回顾
         if _REC_TRACKER:
@@ -1292,6 +1504,8 @@ class Scanner:
         print(f"  多头: {bullish}只  ", end="")
         for k, v in sig_counts.items():
             print(f" {k}:{v}只 ", end="")
+        if c3_count:
+            print(f" 三买:{c3_count}只 ", end="")
 
         # 质地通过率
         quality_checked = [r for r in self.results if r.get("quality_passed") is not None]
@@ -1465,6 +1679,43 @@ class Scanner:
         print(f"  轮动: {rotation_note}")
         print()
 
+        # === 因子拥挤度分析 ===
+        n_res = len(self.results)
+        if n_res >= 30:
+            # 趋势拥挤
+            bull_count = sum(1 for r in self.results if r["trend"] == "多头")
+            bear_count = sum(1 for r in self.results if r["trend"] == "空头")
+            bull_pct = bull_count / n_res * 100
+            bear_pct = bear_count / n_res * 100
+
+            # 威科夫信号拥挤
+            buy_sigs = {"Spring", "SOS", "LPS", "弱Spring", "Compression"}
+            sell_sigs = {"Upthrust", "EVR"}
+            sig_high = sum(1 for r in self.results if r.get("wyckoff_score", 0) >= 70)
+            sig_low = sum(1 for r in self.results if r.get("wyckoff_score", 0) <= 30)
+            sig_high_pct = sig_high / n_res * 100
+            sig_low_pct = sig_low / n_res * 100
+
+            # 成交量因子拥挤（strength 含量价信息）
+            vol_high = sum(1 for r in self.results if r.get("strength", 0) >= 65)
+            vol_low = sum(1 for r in self.results if r.get("strength", 0) <= 35)
+            vol_high_pct = vol_high / n_res * 100
+
+            print(f"  【因子拥挤度 — 高分占比越高=因子越拥挤(可能衰减)】")
+            print(f"  {'因子/信号':<14} {'高分%':>8} {'拥挤':>6}")
+            print(f"  " + "-" * 30)
+            def crowd_label(pct):
+                if pct > 50: return "!!过挤"
+                if pct > 35: return "拥挤.."
+                if pct > 20: return "偏高"
+                return "正常"
+            print(f"  {'多头趋势':<14} {bull_pct:>7.0f}%  {crowd_label(bull_pct):>6}")
+            print(f"  {'空头趋势':<14} {bear_pct:>7.0f}%  {crowd_label(bear_pct):>6}")
+            print(f"  {'威科夫高分(≥70)':<14} {sig_high_pct:>7.0f}%  {crowd_label(sig_high_pct):>6}")
+            print(f"  {'威科夫低分(≤30)':<14} {sig_low_pct:>7.0f}%  {crowd_label(sig_low_pct):>6}")
+            print(f"  {'量价强势(≥65)':<14} {vol_high_pct:>7.0f}%  {crowd_label(vol_high_pct):>6}")
+            print()
+
         # === 股票池状态 ===
         if hasattr(self, "watchlist_results"):
             pool = self.watchlist_results.get("pool", [])
@@ -1551,8 +1802,8 @@ class Scanner:
 
         # === Top N ===
         print(f"  [Top {top_n}]")
-        print(f"  {'#':<3} {'代码':<8} {'名称':<7} {'板块':<12} {'趋势':<10} {'威科夫':<18} {'形态':<16} {'价格':<8} {'成交额':<8} {'质地':<6}")
-        print(f"  " + "-" * 125)
+        print(f"  {'#':<3} {'代码':<8} {'名称':<7} {'板块':<12} {'趋势':<10} {'威科夫':<18} {'形态':<16} {'三买':<14} {'价格':<8} {'成交额':<8} {'质地':<6}")
+        print(f"  " + "-" * 140)
 
         for i, r in enumerate(self.results[:top_n]):
             sym = r["code"].split(".")[1]
@@ -1579,12 +1830,37 @@ class Scanner:
             ps = r.get("pattern_score", 0)
             p_str = f"{pn}({ps})" if pn != "-" else "-"
 
+            # 三买信号
+            cb = r.get("chan_third_buy")
+            cb_str = "-"
+            if cb:
+                cb_str = f"{cb['signal']}({cb['score']})" if cb.get("detail") else cb["signal"]
+
             price = f"{r['price']:.2f}"
             amt = f"{r['amount']/1e8:.1f}亿"
             qf = "通过" if r.get("quality_passed") else ("未检" if r.get("quality_passed") is None else "未过")
-            print(f"  {i+1:<3} {sym:<8} {name:<7} {ind:<12} {trend:<10} {sig_str:<18} {p_str:<16} {price:<8} {amt:<8} {qf:<6}")
+            print(f"  {i+1:<3} {sym:<8} {name:<7} {ind:<12} {trend:<10} {sig_str:<18} {p_str:<16} {cb_str:<14} {price:<8} {amt:<8} {qf:<6}")
 
         print()
+
+        # === 缠论三买执行信号 ===
+        c3_stocks = [r for r in self.results if r.get("chan_third_buy") and r["chan_third_buy"]["signal"] == "三买"]
+        if c3_stocks:
+            print(f"  【缠论三买执行信号 — 中枢突破回踩确认】")
+            print(f"  {'信号':<14} {'代码':<8} {'名称':<7} {'板块':<12} {'趋势':<10} {'威科夫':<18} {'细节':<36}")
+            print(f"  " + "-" * 110)
+            for r in c3_stocks[:10]:
+                cb = r["chan_third_buy"]
+                sym = r["code"].split(".")[1]
+                name = r["name"][:6]
+                ind = r.get("industry", "其他")[:10]
+                tr = f"{r['trend']}({r['strength']:+.1f}%)" if r["trend"] in ("多头", "空头") else r["trend"]
+                sg = r["wyckoff_sig"]
+                sc = r["wyckoff_score"]
+                sg_str = f"{sg}({sc})" if sg not in ("-", "无信号") else sg
+                detail = cb.get("detail", "")[:36]
+                print(f"  {cb['signal']}({cb['score']})  {sym:<8} {name:<7} {ind:<12} {tr:<10} {sg_str:<18} {detail:<36}")
+            print()
 
         # === 龙虎榜异动 ===
         if _LHB_TOOL and lhb_map:
@@ -1680,6 +1956,9 @@ class Scanner:
 
         if pattern_count:
             notes.append(f"形态信号{pattern_count}只(确认{pattern_confirmed})")
+
+        if c3_count:
+            notes.append(f"三买{c3_count}只")
 
         if concentration > 50:
             notes.append(f"板块高度集中在{top_sector}，注意轮动风险")
