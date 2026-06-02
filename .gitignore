@@ -29,9 +29,12 @@ config.json
 .vscode/
 .idea/
 
-# OS
+# OS / Windows
 .DS_Store
 Thumbs.db
+*.bat
+*.cmd
+*.docx
 
 # Environment
 .env
