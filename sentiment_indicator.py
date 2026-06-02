@@ -132,7 +132,7 @@ def _get_limit_intensity(trade_date=None):
         data = {}
         pro = _get_pro()
         for d in _trading_dates(10):
-            df = pro.daily(trade_date=d)
+            df = pro.daily(adj='qfq', trade_date=d)
             if df is not None and len(df):
                 data[d] = {
                     "up": int((df["pct_chg"] >= 9.5).sum()),
@@ -214,7 +214,7 @@ def _get_advance_decline(trade_date=None):
     pro = _get_pro()
     dt = (trade_date or _last_trading_day())
     try:
-        df = pro.daily(trade_date=dt)
+        df = pro.daily(adj='qfq', trade_date=dt)
         if df is None or not len(df):
             return 0, "绿", "无数据"
         up = (df["pct_chg"] > 0).sum()
@@ -417,7 +417,7 @@ def _get_ipo_first_day(trade_date=None):
             price = float(row["price"]) if pd.notna(row["price"]) else 0
             if not issue_date or price <= 0:
                 continue
-            d = pro.daily(ts_code=row["ts_code"], start_date=issue_date, end_date=issue_date)
+            d = pro.daily(adj='qfq', ts_code=row["ts_code"], start_date=issue_date, end_date=issue_date)
             if d is not None and len(d):
                 gains.append((issue_date[:6], (float(d["close"].iloc[0]) / price - 1) * 100))
         if not gains:

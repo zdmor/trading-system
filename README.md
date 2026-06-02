@@ -1,23 +1,24 @@
-# A股交易分析系统
+# 三花交易系统
 
-多因子评分 + 威科夫形态识别的 A 股分析工具。
+A 股威科夫交易系统。倾向派架构：市场状态识别驱动决策，频率统计做风险约束，自适应校准做参数优化。
 
-数据源：新浪财经（实时行情）、腾讯财经（K线）、Tushare Pro（龙虎榜/个股质地）、AKShare（板块/舆情/关键词热度）。
+**顶层设计：** [系统哲学白皮书](docs/system_philosophy.md)
 
-## 安装
+## 核心架构
 
-```bash
-pip install -r requirements.txt
+```
+大盘数据 → Wyckoff 阶段分类 → 2D 门控(阶段×信号比) → scanner 选股 → pre_buy_checklist → 执行
 ```
 
-需要 Tushare Pro token（5000积分）请配置 `config.json`：
-```json
-{"tushare_token": "你的token"}
-```
+### 三层概率架构
 
-## 系统架构
+| 层 | 职责 | 核心组件 |
+|---|------|---------|
+| 倾向派（核心） | 市场状态识别 | `market_regime._classify_wyckoff_phase()`、PHASE_SIGNAL_MAP |
+| 频率派（工具） | 统计基准与风险约束 | 信号比红黄绿灯、因子 IC |
+| 自适应层（优化） | 窗口式参数校准 | 因子权重月更、信号质量季更 |
 
-### 8 因子评分系统 (`scoring.py`)
+### 8 因子评分
 
 | 因子 | 权重 | 说明 |
 |------|------|------|
@@ -30,59 +31,42 @@ pip install -r requirements.txt
 | 大盘趋势 | 12% | 指数MA排列/量能确认 |
 | 相对强度 | 12% | 个股vs大盘超额收益 |
 
-### 扫描系统 (`scanner.py`)
+## 快速开始
 
-- 流动性过滤（成交额门槛）
-- 威科夫形态检测（Spring/SOS/LPS/Upthrust）
-- 板块轮动分组
-- 多重过滤（量比动量+均线+斜率）
-- Feishu 推送通知
-
-### 模块文件
-
-| 文件 | 功能 |
-|------|------|
-| `volume_momentum.py` | 量比动量系统：量比均线 + 斜率 + 综合评分 |
-| `buzz_monitor.py` | 热度监控：股吧评分 + 关键词热度 + 过热预警 |
-| `sentiment_indicator.py` | 情绪指标：每日/每周市场情绪 + 3σ 过热检测 |
-| `lhb_analyzer.py` | 龙虎榜分析：席位分类 + 溢价追踪 |
-| `pattern_detector.py` | 形态检测：双顶/双底/头肩顶/头肩底/V转 |
-| `factor_ic_rolling.py` | 因子 IC 滚动回测 |
-| `sector_heat.py` | 板块景气度五维评分 |
-| `recommendation_tracker.py` | 推荐记录追踪 |
-
-## 用法
-
-### 全市场扫描
 ```bash
+# 安装依赖
+pip install -r requirements.txt
+
+# 全市场扫描
 python scanner.py
-```
 
-### 个股分析
-```bash
+# 个股分析
 python main.py <股票代码>
-python main.py 002050 80000 --position 100,51.44
+
+# 大盘状态
+python market_regime.py
+
+# 买入检查清单
+python pre_buy_checklist.py --ticker <代码> --price <价格>
 ```
 
-### 量比动量扫描
-```bash
-python vol_mom_scan.py --top 200 --regime neutral
-```
+需要 Tushare Pro token 配置在 `config.json`。
 
-### 龙虎榜分析
-```bash
-python lhb_analyzer.py
-```
+## 项目路线图
 
-### 情绪指标
-```bash
-python sentiment_indicator.py
-```
+- **Phase 1**（本周）：偏离上限 25% + 止损集成 + RPS 排名
+- **Phase 2**（6 月）：信号反馈闭环 + 通道分类 + 动态调参
+- **Phase 3**（7 月）：分钟线分析 + 板块轮动 + 缠论三买
 
-## 数据来源
+详见 `docs/system_philosophy.md` 第 6 节。
+
+## 边界
+
+专注 A 股中长线（持仓 20-60 日）。不做短线/期权/量化打板/纯 ML 预测/跨市场。
+
+## 数据源
 
 - 实时行情：新浪财经 HTTP API
 - K 线：腾讯财经 HTTP API
-- 龙虎榜/个股质地：Tushare Pro
-- 板块/舆情/关键词：AKShare
-- 行业分类：baostock
+- 基本面/龙虎榜：Tushare Pro
+- 板块/舆情：AKShare

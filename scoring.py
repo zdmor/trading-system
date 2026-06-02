@@ -55,6 +55,13 @@ try:
 except ImportError:
     _DYNAMIC_WEIGHTS_OK = False
 
+# Bayesian signal fusion
+try:
+    from bayesian_fusion import BayesianFusion
+    _BAYESIAN_OK = True
+except ImportError:
+    _BAYESIAN_OK = False
+
 # 多因子多空辩论模块
 try:
     from bull_bear_debate import debate_factors
@@ -103,6 +110,13 @@ SCORE_LEVELS = [
 _CALIB_EXPECTED = {"80": 0.62, "70": 0.56, "60": 0.52, "50": 0.48}
 _CALIB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration.json")
 
+
+
+def _gaussian_weights(window=20, sigma=5.0):
+    """Generate Gaussian kernel weight array, center (newest) has max weight"""
+    x = np.arange(window)
+    weights = np.exp(-((x - (window - 1)) ** 2) / (2 * sigma ** 2))
+    return weights / weights.sum()
 
 def _score_bracket(score):
     if score >= 80: return "80"
@@ -254,14 +268,15 @@ class StockScorer:
             elif best_raw_score <= 50:
                 base = max(0, base - 8)
 
-        # 阶段加成
+        # 阶段加成（classify_phase 新标签精确匹配）
         phase = self.wyckoff_phase or ""
-        if "Markup" in phase or "Phase D" in phase or "Phase E" in phase:
-            base += 5
-        elif "Phase B" in phase or "Phase C" in phase:
-            base += 3
-        elif "派发" in phase or "Phase" not in phase:
-            base -= 5
+        if phase in ("Markup",):
+            base += 5                 # 主升段：加分
+        elif phase in ("Accum_A", "Accum_B", "Accum_C"):
+            base += 3                 # 吸筹阶段：小幅加分
+        elif phase in ("Distribute_A", "Distribute_B", "Markdown"):
+            base -= 5                 # 派发/下跌：扣分
+        # Range / "" → 中性，不加不扣
 
         final = max(0, min(100, base))
         return {
@@ -371,7 +386,7 @@ class StockScorer:
             lookback = min(120, len(volumes) - 1)
             hist_ratios = []
             for i in range(len(volumes) - lookback, len(volumes)):
-                avg = np.mean(volumes[max(0, i-20):i]) if i >= 20 else np.mean(volumes[:max(1,i)])
+                window = min(20, i); avg = np.average(volumes[max(0, i-window):i], weights=_gaussian_weights(window)) if window >= 2 else float(volumes[i-1])
                 hist_ratios.append(volumes[i] / avg if avg > 0 else 1.0)
             vol_history = hist_ratios[-lookback:]
 
@@ -719,7 +734,7 @@ class StockScorer:
         # 质_动量：量能验证趋势质量 — 趋势需要成交量确认才可信
         try:
             volumes = self.df["volume"].values.astype(float)
-            vol_ma20 = np.mean(volumes[-20:]) if len(volumes) >= 20 else np.mean(volumes)
+            w20 = min(20, len(volumes)); vol_ma20 = np.average(volumes[-w20:], weights=_gaussian_weights(w20))
             vol_ratio = volumes[-1] / max(vol_ma20, 1)
             vol_5 = np.mean(volumes[-5:]) if len(volumes) >= 5 else volumes[-1]
             vol_prev5 = np.mean(volumes[-10:-5]) if len(volumes) >= 10 else 1
@@ -813,7 +828,7 @@ class StockScorer:
         # 成交量确认（涨有量跌缩量 → 健康）
         if len(mdf) >= 40:
             volumes = mdf["volume"].values.astype(float) if "volume" in mdf.columns else np.ones_like(closes) * np.mean(closes)
-            vol_20 = np.mean(volumes[-20:])
+            w20 = min(20, len(volumes)); vol_20 = np.average(volumes[-w20:], weights=_gaussian_weights(w20))
             vol_prior = np.mean(volumes[-40:-20]) if len(volumes) >= 40 else vol_20
             if vol_20 > vol_prior * 1.2 and ret_20d if len(closes) >= 20 else 0:
                 pass  # 放量上涨已经体现在涨幅加分中
@@ -943,7 +958,7 @@ class StockScorer:
         price = closes[-1]
 
         # 量比
-        vol_ma20 = np.mean(volumes[-20:]) if n >= 20 else np.mean(volumes)
+        w20 = min(20, n); vol_ma20 = np.average(volumes[-w20:], weights=_gaussian_weights(w20))
         vol_ratio = volumes[-1] / max(vol_ma20, 1)
 
         # 阴阳
@@ -1037,6 +1052,8 @@ class StockScorer:
         active_weights = get_weights() if _DYNAMIC_WEIGHTS_OK else WEIGHTS
 
         for key, weight in active_weights.items():
+            if key not in factors:
+                continue  # 动态权重引入的新因子尚未实现评分
             f = factors[key]
             contribution = f["score"] * weight
             composite += contribution
@@ -1049,6 +1066,11 @@ class StockScorer:
                 "detail": f["detail"],
                 "weight_pct": int(weight * 100),
             })
+
+        # 重归一化：排除未实现因子的权重
+        used_weight = sum(w for k, w in active_weights.items() if k in factors)
+        if used_weight > 0 and used_weight < 1.0:
+            composite = round(composite / used_weight, 1)
 
         composite = round(composite, 1)
 
@@ -1141,12 +1163,27 @@ class StockScorer:
         elif sector_score < 40:
             pos_factor *= 0.75
 
+        # Bayesian fusion: convert scores to P(up | factors)
+        bayes_prob = 0.5
+        bayes_level = "中"
+        if _BAYESIAN_OK:
+            try:
+                _bf = BayesianFusion()
+                _bf.load()
+                factor_scores = {k: v.get("score", 50) for k, v in factor_details.items()}
+                bayes_prob = _bf.predict_proba(factor_scores)
+                bayes_level = _bf.predict_level(bayes_prob)
+            except Exception:
+                pass
+
         return {
             "composite_score": composite,
             "action": action,
             "pos_factor": round(pos_factor, 4),
             "factors": breakdown_lines,
             "level": self._label(composite),
+            "bayesian_prob": round(bayes_prob, 3),
+            "bayesian_level": bayes_level,
             "kelly_detail": kelly_detail,
             "stop_price": self.stop_price,
             "stop_pct": round((self.price - self.stop_price) / self.price * 100, 1),

@@ -18,8 +18,10 @@ def _load():
 
 
 def _save(data):
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+    tmp = HISTORY_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, HISTORY_FILE)  # 原子替换
 
 
 def save_scan_result(results, pool, holdings, recommendations, indices, top_n=15):

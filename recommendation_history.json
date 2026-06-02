@@ -921,5 +921,521 @@
       }
     ],
     "update_time": "10:58"
+  },
+  "2026-06-02": {
+    "market": {
+      "sh000001": {
+        "name": "上证指数",
+        "price": 4075.1,
+        "change_pct": 0.43
+      },
+      "sz399001": {
+        "name": "深证成指",
+        "price": 15591.13,
+        "change_pct": 1.63
+      },
+      "sz399006": {
+        "name": "创业板指",
+        "price": 4055.87,
+        "change_pct": 2.66
+      },
+      "sh000688": {
+        "name": "科创50",
+        "price": 1690.56,
+        "change_pct": 1.62
+      }
+    },
+    "recommendations": [
+      {
+        "code": "000001",
+        "name": "平安银行",
+        "signal": "Upthrust",
+        "score": 56,
+        "price": 0,
+        "suggest": "不追/减仓"
+      },
+      {
+        "code": "000409",
+        "name": "云鼎科技",
+        "signal": "Spring",
+        "score": 72,
+        "price": 0,
+        "suggest": "关注"
+      },
+      {
+        "code": "000411",
+        "name": "英特集团",
+        "signal": "Upthrust",
+        "score": 78,
+        "price": 0,
+        "suggest": "不追/减仓"
+      },
+      {
+        "code": "000151",
+        "name": "中成股份",
+        "signal": "EVR",
+        "score": 65,
+        "price": 0,
+        "suggest": "回避"
+      },
+      {
+        "code": "000068",
+        "name": "华控赛格",
+        "signal": "Upthrust",
+        "score": 98,
+        "price": 0,
+        "suggest": "不追/减仓"
+      }
+    ],
+    "top": [
+      {
+        "code": "000001",
+        "name": "平安银行",
+        "signal": "Upthrust",
+        "score": 56,
+        "price": 0,
+        "trend": "空头",
+        "quality": true
+      },
+      {
+        "code": "000062",
+        "name": "深圳华强",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "多头",
+        "quality": true
+      },
+      {
+        "code": "000027",
+        "name": "深圳能源",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "多头",
+        "quality": true
+      },
+      {
+        "code": "000037",
+        "name": "深南电A",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "多头",
+        "quality": true
+      },
+      {
+        "code": "000404",
+        "name": "长虹华意",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "多头",
+        "quality": true
+      },
+      {
+        "code": "000159",
+        "name": "国际实业",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "多头",
+        "quality": true
+      },
+      {
+        "code": "000059",
+        "name": "华锦股份",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "空头",
+        "quality": true
+      },
+      {
+        "code": "000407",
+        "name": "胜利股份",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "多头",
+        "quality": true
+      },
+      {
+        "code": "000099",
+        "name": "中信海直",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "空头",
+        "quality": true
+      },
+      {
+        "code": "000050",
+        "name": "深天马Ａ",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "空头",
+        "quality": true
+      },
+      {
+        "code": "000301",
+        "name": "东方盛虹",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "多头",
+        "quality": true
+      },
+      {
+        "code": "000409",
+        "name": "云鼎科技",
+        "signal": "Spring",
+        "score": 72,
+        "price": 0,
+        "trend": "空头",
+        "quality": true
+      },
+      {
+        "code": "000021",
+        "name": "深科技",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "多头",
+        "quality": true
+      },
+      {
+        "code": "000411",
+        "name": "英特集团",
+        "signal": "Upthrust",
+        "score": 78,
+        "price": 0,
+        "trend": "空头",
+        "quality": true
+      },
+      {
+        "code": "000155",
+        "name": "川能动力",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "多头",
+        "quality": true
+      }
+    ],
+    "pool": [
+      {
+        "code": "600309",
+        "name": "万华化学",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "多头",
+        "phase": "Accum_A"
+      },
+      {
+        "code": "000651",
+        "name": "格力电器",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "空头",
+        "phase": "Distribute_A"
+      },
+      {
+        "code": "600415",
+        "name": "小商品城",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "空头",
+        "phase": "Accum_A"
+      },
+      {
+        "code": "002714",
+        "name": "牧原股份",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "空头",
+        "phase": "Accum_B"
+      },
+      {
+        "code": "000988",
+        "name": "华工科技",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "多头",
+        "phase": "Range"
+      },
+      {
+        "code": "002648",
+        "name": "卫星化学",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "多头",
+        "phase": "Accum_B"
+      },
+      {
+        "code": "000920",
+        "name": "沃顿科技",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "空头",
+        "phase": "Range"
+      },
+      {
+        "code": "300976",
+        "name": "达瑞电子",
+        "signal": "SOS",
+        "score": 93,
+        "price": 0,
+        "trend": "多头",
+        "phase": "Markup"
+      },
+      {
+        "code": "002709",
+        "name": "天赐材料",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "多头",
+        "phase": "Distribute_B"
+      },
+      {
+        "code": "603713",
+        "name": "密尔克卫",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "空头",
+        "phase": "Range"
+      },
+      {
+        "code": "600968",
+        "name": "海油发展",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "多头",
+        "phase": "Markdown"
+      },
+      {
+        "code": "603871",
+        "name": "嘉友国际",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "空头",
+        "phase": "Range"
+      },
+      {
+        "code": "603993",
+        "name": "洛阳钼业",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "多头",
+        "phase": "Range"
+      },
+      {
+        "code": "300750",
+        "name": "宁德时代",
+        "signal": "SOS",
+        "score": 58,
+        "price": 0,
+        "trend": "多头",
+        "phase": "Markup"
+      },
+      {
+        "code": "300308",
+        "name": "中际旭创",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "多头",
+        "phase": "Markup"
+      },
+      {
+        "code": "600580",
+        "name": "卧龙电驱",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "空头",
+        "phase": "Range"
+      },
+      {
+        "code": "600285",
+        "name": "羚锐制药",
+        "signal": "Upthrust",
+        "score": 63,
+        "price": 0,
+        "trend": "空头",
+        "phase": "Distribute_B"
+      },
+      {
+        "code": "688603",
+        "name": "天承科技",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "多头",
+        "phase": "Markup"
+      },
+      {
+        "code": "605099",
+        "name": "共创草坪",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "多头",
+        "phase": "Accum_B"
+      },
+      {
+        "code": "300274",
+        "name": "阳光电源",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "空头",
+        "phase": "Distribute_B"
+      },
+      {
+        "code": "300628",
+        "name": "亿联网络",
+        "signal": "SOS",
+        "score": 95,
+        "price": 0,
+        "trend": "多头",
+        "phase": "Markup"
+      },
+      {
+        "code": "002158",
+        "name": "汉钟精机",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "多头",
+        "phase": "Range"
+      },
+      {
+        "code": "600529",
+        "name": "山东药玻",
+        "signal": "Upthrust",
+        "score": 68,
+        "price": 0,
+        "trend": "空头",
+        "phase": "Distribute_A"
+      },
+      {
+        "code": "688120",
+        "name": "华海清科",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "多头",
+        "phase": "Range"
+      }
+    ],
+    "holdings": [
+      {
+        "code": "002050",
+        "name": "三花智控",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "cost": 51.44,
+        "pnl": null,
+        "suggest": ""
+      },
+      {
+        "code": "600038",
+        "name": "中直股份",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "cost": 35.37,
+        "pnl": null,
+        "suggest": ""
+      },
+      {
+        "code": "600011",
+        "name": "华能国际",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "cost": 9.6,
+        "pnl": null,
+        "suggest": ""
+      }
+    ],
+    "research": [
+      {
+        "code": "600183",
+        "name": "生益科技",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "-",
+        "quality": null,
+        "in_top": false
+      },
+      {
+        "code": "688183",
+        "name": "生益电子",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "-",
+        "quality": null,
+        "in_top": false
+      },
+      {
+        "code": "600150",
+        "name": "中国船舶",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "-",
+        "quality": null,
+        "in_top": false
+      },
+      {
+        "code": "000725",
+        "name": "京东方A",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "-",
+        "quality": null,
+        "in_top": false
+      },
+      {
+        "code": "000100",
+        "name": "TCL科技",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "空头",
+        "quality": null,
+        "in_top": true
+      },
+      {
+        "code": "002064",
+        "name": "华峰化学",
+        "signal": "-",
+        "score": 0,
+        "price": 0,
+        "trend": "-",
+        "quality": null,
+        "in_top": false
+      }
+    ],
+    "update_time": "15:20"
   }
 }

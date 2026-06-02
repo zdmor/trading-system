@@ -96,7 +96,7 @@ def _calc_high_board(pro, today: str) -> int:
     # 获取最近15天的日线数据（覆盖可能的连板）
     start_d = (datetime.strptime(today, "%Y%m%d") - timedelta(days=30)).strftime("%Y%m%d")
     try:
-        df_all = pro.daily(trade_date=today)
+        df_all = pro.daily(adj='qfq', trade_date=today)
     except Exception:
         return 0
 
@@ -115,7 +115,7 @@ def _calc_high_board(pro, today: str) -> int:
     for offset in range(1, 15):
         prev_date = (date - timedelta(days=offset)).strftime("%Y%m%d")
         try:
-            prev_df = pro.daily(trade_date=prev_date)
+            prev_df = pro.daily(adj='qfq', trade_date=prev_date)
         except Exception:
             break
         if prev_df is None or prev_df.empty:
@@ -135,7 +135,7 @@ def _calc_high_board(pro, today: str) -> int:
 def _zting_count(pro, today: str) -> int:
     """涨停家数：pct_chg >= 9.5%"""
     try:
-        df = pro.daily(trade_date=today)
+        df = pro.daily(adj='qfq', trade_date=today)
     except Exception:
         return 0
     if df is None or df.empty:
@@ -150,7 +150,7 @@ def _yesterday_zting_premium(pro, today: str) -> float:
 
     # 昨天涨停列表
     try:
-        df_y = pro.daily(trade_date=yesterday)
+        df_y = pro.daily(adj='qfq', trade_date=yesterday)
     except Exception:
         return 0.0
     if df_y is None or df_y.empty:
@@ -162,7 +162,7 @@ def _yesterday_zting_premium(pro, today: str) -> float:
 
     # 今天这些股票的涨幅
     try:
-        df_t = pro.daily(trade_date=today)
+        df_t = pro.daily(adj='qfq', trade_date=today)
     except Exception:
         return 0.0
     if df_t is None or df_t.empty:
@@ -183,7 +183,7 @@ def _zha_ban_rate(pro, today: str) -> float:
     炸板率 = 触板未封数 / (封板数 + 触板未封数)
     """
     try:
-        df = pro.daily(trade_date=today)
+        df = pro.daily(adj='qfq', trade_date=today)
     except Exception:
         return 0.0
     if df is None or df.empty:

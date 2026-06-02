@@ -1,3 +1,4 @@
+from rmt_denoise import compute_rmt_weights, rmt_threshold
 """
 动态因子权重系统
 
@@ -12,6 +13,7 @@ ICIR = mean_ic / std_ic — 衡量因子稳定性与预测能力的综合指标
 import json
 import os
 import numpy as np
+import chaos_theory as cth
 from datetime import datetime, timedelta
 from typing import Optional
 from collections import defaultdict
@@ -22,12 +24,17 @@ from collections import defaultdict
 # volatility 全周期正 IC (+0.051, ICIR+0.31)，反转市区分度最强
 # tech_strength/relative_strength 反转市有效，保留中等权重
 BASE_WEIGHTS = {
-    "risk_reward": 0.37,
-    "tech_strength": 0.18,
-    "relative_strength": 0.14,
-    "volume": 0.12,
-    "candlestick": 0.11,
-    "volatility": 0.08,
+    "risk_reward": 0.3145,
+    "tech_strength": 0.153,
+    "relative_strength": 0.119,
+    "volume": 0.102,
+    "candlestick": 0.0935,
+    "volatility": 0.068,
+    "orbit_compression": 0.05,
+    "lyapunov": 0.03,
+    "hurst": 0.03,
+    "fractal_dim": 0.02,
+    "attractor_shape": 0.02,
 }
 
 # 调节参数
@@ -70,12 +77,53 @@ def update_ic_cache(ic_results: dict) -> dict:
     return compute_weights(ic_results)
 
 
+def _build_rmt_history() -> tuple | None:
+    """从滚动 DB 构建因子历史矩阵用于 RMT 去噪。
+
+    Returns:
+        (factor_history, ic_vector, factor_names) 或 None（样本不足）
+    """
+    db = _load_rolling_db()
+    pairs = db.get("pairs", [])
+    if len(pairs) < 60:
+        return None
+
+    # 按日期分组，计算每截面各因子均值
+    date_groups = defaultdict(list)
+    for p in pairs:
+        date_groups[p["date"]].append(p)
+
+    factor_keys = [k for k in BASE_WEIGHTS if k in _FACTOR_KEYS]
+    if len(factor_keys) < 2:
+        return None
+
+    dates_sorted = sorted(date_groups.keys())
+    if len(dates_sorted) < 20:
+        return None
+
+    # 提取 IC 向量
+    cache = _load_ic_cache()
+    ic_data = cache.get("data", {})
+    ic_vector = np.array([ic_data.get(k, {}).get("ic", 0.01) or 0.01 for k in factor_keys])
+
+    # 构建因子历史矩阵 (n_dates, n_factors)
+    history = []
+    for d in dates_sorted:
+        group = date_groups[d]
+        scores = []
+        for k in factor_keys:
+            vals = [p["factors"].get(k, 50) for p in group]
+            scores.append(np.mean(vals))
+        history.append(scores)
+
+    return np.array(history), ic_vector, factor_keys
+
+
 def compute_weights(ic_data: Optional[dict] = None) -> dict:
     """
     计算有效权重:
-      1) icir 归一化到 [-1, 1]
-      2) w_eff = w_base * (1 + K * icir_norm)
-      3) 钳制 + 归一化合计 = 1.0
+      1) RMT 去噪权重（数据够时）
+      2) 回退到 ICIR 动态调整
     """
     if ic_data is None:
         cache = _load_ic_cache()
@@ -84,13 +132,36 @@ def compute_weights(ic_data: Optional[dict] = None) -> dict:
     if not ic_data:
         return dict(BASE_WEIGHTS)
 
-    # 提取 ICIR，缺失的因子取 0
+    # RMT 去噪权重（动态覆盖）
+    try:
+        rmt_result = _build_rmt_history()
+        if rmt_result is not None:
+            factor_history, ic_vector, factor_names = rmt_result
+            rmt_w = compute_rmt_weights(factor_history, ic_vector, factor_names)
+            if rmt_w is not None and len(rmt_w) == len(factor_names):
+                # 补齐未参与 RMT 的因子（用基础权重）
+                weights = dict(BASE_WEIGHTS)
+                rmt_total = sum(rmt_w.values())
+                if rmt_total > 0:
+                    for k in rmt_w:
+                        weights[k] = rmt_w[k]
+                    # 归一化
+                    total = sum(weights.values())
+                    weights = {k: round(v / total, 4) for k, v in weights.items()}
+                    diff = round(1.0 - sum(weights.values()), 4)
+                    if diff:
+                        key_max = max(weights, key=weights.get)
+                        weights[key_max] = round(weights[key_max] + diff, 4)
+                    return weights
+    except Exception:
+        pass
+
+    # 回退：ICIR 动态调整
     icirs = {}
     for key in BASE_WEIGHTS:
         d = ic_data.get(key, {})
         icirs[key] = d.get("icir", 0) or 0
 
-    # ICIR 归一化到 [-1, 1]
     vals = list(icirs.values())
     max_abs = max(abs(v) for v in vals) if vals else 1.0
     if max_abs < 0.01:
@@ -101,16 +172,13 @@ def compute_weights(ic_data: Optional[dict] = None) -> dict:
         icir_norm = max(-1.0, min(1.0, icirs[key] / max_abs))
         raw[key] = BASE_WEIGHTS[key] * (1.0 + K * icir_norm)
 
-    # 钳制
     for key in raw:
         hi = BASE_WEIGHTS[key] * MAX_MULTIPLIER
         raw[key] = max(MIN_WEIGHT, min(hi, raw[key]))
 
-    # 归一化
     total = sum(raw.values())
     weights = {k: round(v / total, 4) for k, v in raw.items()} if total > 0 else dict(BASE_WEIGHTS)
 
-    # 修正四舍五入误差
     diff = round(1.0 - sum(weights.values()), 4)
     if diff:
         key_max = max(weights, key=weights.get)
@@ -150,13 +218,26 @@ def show_weight_report():
         print(f"  {key:<18} {b:>6.0%} {e:>6.0%} {d_str:>6}  {icir_str:>6} {ic_str:>8}")
     print(f"  {'-'*55}")
     print(f"  {'合计':<18} {sum(base.values()):>6.0%} {sum(eff.values()):>6.0%}")
+
+    # 盲区验证结果引用（文件不存在则跳过）
+    blindspot_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_cache", "blindspot_results.json")
+    if os.path.exists(blindspot_path):
+        try:
+            with open(blindspot_path, "r", encoding="utf-8") as bf:
+                bs = json.load(bf)
+            bs_time = bs.get("run_time", "")[:19] if isinstance(bs, dict) else ""
+            bs_count = len(bs.get("factors", [])) if isinstance(bs, dict) and "factors" in bs else "-"
+            print(f"  [盲区验证] {blindspot_path} (时间: {bs_time}, 因子数: {bs_count})")
+        except Exception:
+            pass
     print()
 
 
 # ─── 滚动 IC 数据库 + 时间衰减 ───
 
 _ROLLING_DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ic_rolling_db.json")
-_FACTOR_KEYS = ["tech_strength", "risk_reward", "volume", "candlestick", "sector", "relative_strength", "volatility"]
+_FACTOR_KEYS = ["tech_strength", "risk_reward", "volume", "candlestick", "sector", "relative_strength", "volatility",
+                "orbit_compression", "lyapunov", "hurst", "fractal_dim", "attractor_shape"]
 
 
 def _spearman_rank(x, y):

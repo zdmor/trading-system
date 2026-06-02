@@ -1,0 +1,15 @@
+{
+  "predictions": [
+    {
+      "date": "2026-05-21",
+      "prediction_type": "Upthrust_verify",
+      "observer": "scanner每日扫描",
+      "judgment": "半导体板块机构在出货（全市场多头仅5%，深科技/华天科技/通富微电/中芯国际等集中Upthrust），后续将跟随大盘下跌",
+      "verify_date": "2026-06-04",
+      "verify_days": 10,
+      "stocks": ["000021", "002185", "002156", "603501", "000100", "600183", "688981", "688347"],
+      "verified": false,
+      "result": null
+    }
+  ]
+}

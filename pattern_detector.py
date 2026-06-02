@@ -631,8 +631,7 @@ class PatternDetector:
     # -------------------------------------------------------
     @classmethod
     def analyze_all(cls, closes: np.ndarray, highs: np.ndarray,
-                    lows: np.ndarray, volumes: np.ndarray,
-                    trend: str = "空头") -> List[PatternResult]:
+                    lows: np.ndarray, volumes: np.ndarray) -> List[PatternResult]:
         """
         运行全部形态检测，返回按得分降序排列的结果列表。
         trend 参数用于过滤反向形态：多头趋势下不报双底（趋势延续而非反转）

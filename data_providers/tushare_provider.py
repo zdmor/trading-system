@@ -433,7 +433,7 @@ class TushareProvider:
 
         # 获取当前价
         try:
-            price_df = pro.daily(ts_code=ts_code, fields='close', limit=1)
+            price_df = pro.daily(adj='qfq', ts_code=ts_code, fields='close', limit=1)
             current_price = float(price_df.iloc[0]['close']) if price_df is not None and not price_df.empty else None
         except Exception:
             current_price = None

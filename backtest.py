@@ -144,11 +144,12 @@ class Backtester:
             h = df_slice["high"].values.astype(float)
             l = df_slice["low"].values.astype(float)
             v = df_slice["volume"].values.astype(float)
+            o = df_slice["open"].values.astype(float)
             phase_label, _, _ = WyckoffAnalyzer.detect_phase(
                 c.tolist(), h.tolist(), l.tolist(), v.tolist(), trend_dir, []
             )
             wyckoff_sigs, _ = WyckoffAnalyzer.analyze_all(
-                c.tolist(), h.tolist(), l.tolist(), v.tolist(), trend_dir
+                c.tolist(), h.tolist(), l.tolist(), o.tolist(), v.tolist()
             )
 
         # 大盘切片（取到当前日期）

@@ -65,11 +65,12 @@ def analyze_at_date(df, code, name, cutoff_date):
             h = sdf["high"].values.astype(float)
             l = sdf["low"].values.astype(float)
             v = sdf["volume"].values.astype(float)
+            o = sdf["open"].values.astype(float)
             phase_label, _, _ = WyckoffAnalyzer.detect_phase(
                 c.tolist(), h.tolist(), l.tolist(), v.tolist(), trend_dir, []
             )
             wyckoff_sigs, _ = WyckoffAnalyzer.analyze_all(
-                c.tolist(), h.tolist(), l.tolist(), v.tolist(), trend_dir
+                c.tolist(), h.tolist(), l.tolist(), o.tolist(), v.tolist()
             )
 
         best_sig = wyckoff_sigs[0] if wyckoff_sigs else ("-", 0, "")

@@ -35,8 +35,16 @@ try:
 except ImportError:
     _REC_TRACKER = False
 
+try:
+    from spring_quality import compute_confidence
+    _SPRING_QUALITY_OK = True
+except ImportError:
+    _SPRING_QUALITY_OK = False
+    _REC_TRACKER = False
+
 from pattern_detector import PatternDetector
 from notifier import send_card, make_div, make_hr, make_note
+from update_state import update as update_state_md
 
 try:
     from lhb_analyzer import enrich_stock_list, analyze_stock
@@ -55,6 +63,32 @@ try:
     _BUZZ_TOOL = True
 except ImportError:
     _BUZZ_TOOL = False
+
+# 高级模块（静默加载，不阻塞主流程）
+try:
+    from bayesian_confidence import BayesianConfidence
+    _BAYES_OK = True
+except Exception:
+    _BAYES_OK = False
+
+try:
+    from kelly_position import load_factor_stats, kelly_fraction, compute_kelly_position
+    _KELLY_OK = True
+except Exception:
+    _KELLY_OK = False
+
+try:
+    from factor_weights import get_weights, BASE_WEIGHTS
+    _WEIGHTS_OK = True
+except Exception:
+    _WEIGHTS_OK = False
+
+# 因子7系统（计算完整多因子评分）
+try:
+    from factor_7_validate import compute_factors_for_stock
+    _FACTOR7_OK = True
+except Exception:
+    _FACTOR7_OK = False
 
 
 # ============================================================
@@ -107,10 +141,367 @@ class WyckoffAnalyzer:
     def _avg(arr):
         return float(np.mean(arr)) if len(arr) > 0 else 1
 
+    # ─── 纯价量驱动的威科夫阶段分类器 ───
+
+    @staticmethod
+    def _w_atr(highs, lows, closes, period=14):
+        """单数组 ATR，不依赖 self.df"""
+        n = len(highs)
+        if n < period + 1:
+            return 0.0
+        trs = []
+        for i in range(-period, 0):
+            h = float(highs[i])
+            l = float(lows[i])
+            pc = float(closes[i - 1])
+            trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+        return float(np.mean(trs)) if trs else 0.0
+
     @classmethod
-    def analyze_all(cls, closes, highs, lows, volumes, trend="空头"):
+    def _phase_features(cls, closes, highs, lows, opens, volumes):
+        """计算分类器所需的全部特征，返回 dict"""
+        n = len(closes)
+        if n < 60:
+            return None
+        c, h, l, o, v = (
+            np.array(closes, dtype=float),
+            np.array(highs, dtype=float),
+            np.array(lows, dtype=float),
+            np.array(opens, dtype=float),
+            np.array(volumes, dtype=float),
+        )
+        # 0. 涨跌停标记 — 用于支撑/阻力测试过滤（_phase_features 无 code 参数，统一用 10%）
+        limit_up = np.zeros(n, dtype=bool)
+        limit_down = np.zeros(n, dtype=bool)
+        limit_pct = 10  # 统一用主板阈值，保守地多过滤几个极端日
+        for i in range(max(1, n - 60), n):
+            prev = c[i - 1]
+            if prev == 0:
+                continue
+            pct = (c[i] - prev) / prev * 100
+            body_range = abs(c[i] - o[i])
+            total_range = h[i] - l[i]
+            body_ratio = body_range / total_range if total_range > 0 else 1.0
+            if pct >= limit_pct * 0.95 and body_ratio >= 0.5:
+                limit_up[i] = True
+            elif pct <= -limit_pct * 0.95 and body_ratio >= 0.5:
+                limit_down[i] = True
+        limit_up_10d = int(np.sum(limit_up[-10:]))
+        limit_down_10d = int(np.sum(limit_down[-10:]))
+
+        # 1. 60日区间位置
+        r_hi = float(np.max(h[-60:]))
+        r_lo = float(np.min(l[-60:]))
+        pos = (c[-1] - r_lo) / (r_hi - r_lo) * 100.0 if r_hi > r_lo else 50.0
+
+        # 2. 量能趋势
+        v10 = float(np.mean(v[-10:]))
+        v20 = float(np.mean(v[-20:]))
+        v50 = float(np.mean(v[-50:])) if n >= 50 else v10
+        vol_ratio = v10 / v50 if v50 > 0 else 1.0
+
+        # 3. 支撑测试 (60日) — 排除跌停日（非真实测试）
+        lo60 = float(np.min(l[-60:]))
+        supp_mask = l[-60:] <= lo60 * 1.03
+        supp_mask &= ~limit_down[-60:]
+        support_tests = int(np.sum(supp_mask))
+
+        # 4. 阻力测试 — 排除涨停日
+        hi60 = float(np.max(h[-60:]))
+        resis_mask = h[-60:] >= hi60 * 0.97
+        resis_mask &= ~limit_up[-60:]
+        resistance_tests = int(np.sum(resis_mask))
+
+        # 5. 高潮柱 (宽振幅+巨量)
+        avg_r30 = float(np.mean(np.abs(h[-30:] - l[-30:])))
+        avg_v20_feat = float(np.mean(v[-20:])) if n >= 20 else 1
+        climax_idx = -1
+        for i in range(-1, -30, -1):  # 从最新往最旧找，找到最近的一根
+            rng = float(h[i] - l[i])
+            if rng > avg_r30 * 1.5 and v[i] > avg_v20_feat * 2.0:
+                climax_idx = i
+                break
+
+        # 6. 下影线 — 排除一字板（非真实供需）
+        lw_ratios = []
+        lw_count = 0
+        for i in range(-20, 0):
+            if limit_up[i] or limit_down[i]:  # 一字板无真实影线
+                lw_ratios.append(0.5)  # 中性值，不影响均值
+                continue
+            body_bot = min(c[i], o[i])
+            total = float(h[i] - l[i])
+            r = (body_bot - float(l[i])) / total if total > 0 else 0
+            lw_ratios.append(r)
+            if r > 0.35:
+                lw_count += 1
+        avg_lw = float(np.mean(lw_ratios)) if lw_ratios else 0
+
+        # 7. 上影线 — 排除一字板
+        uw_ratios = []
+        uw_count = 0
+        for i in range(-20, 0):
+            if limit_up[i] or limit_down[i]:  # 一字板无真实影线
+                uw_ratios.append(0.5)  # 中性值
+                continue
+            body_top = max(c[i], o[i])
+            total = float(h[i] - l[i])
+            r = (float(h[i]) - body_top) / total if total > 0 else 0
+            uw_ratios.append(r)
+            if r > 0.4:
+                uw_count += 1
+        avg_uw = float(np.mean(uw_ratios)) if uw_ratios else 0
+
+        # 8. MA50 / MA200
+        ma50 = float(np.mean(c[-50:]))
+        ma200 = float(np.mean(c[-200:])) if n >= 200 else ma50
+        ma_gap = (ma50 / ma200 - 1) * 100.0 if ma200 > 0 else 0
+        above_ma50 = c[-1] > ma50
+
+        # 9. ATR 趋势
+        atr_recent = cls._w_atr(h[-20:], l[-20:], c[-20:], 14) if n >= 20 else 0
+        atr_hist = cls._w_atr(h[-60:-20], l[-60:-20], c[-60:-20], 14) if n >= 60 else 0
+        atr_trend = atr_recent / atr_hist if atr_hist > 0 else 1.0
+
+        # 10. 缩量反弹 (climax 后量萎缩)
+        vol_dried_up = False
+        if climax_idx < -4:  # climax 至少在4天前
+            end = None if climax_idx + 6 >= 0 else max(climax_idx + 6, -1)
+            post_vol = np.mean(v[climax_idx + 1: end]) if end is not None else np.mean(v[climax_idx + 1:])
+            climax_vol = float(v[climax_idx])
+            if climax_vol > 0 and post_vol < climax_vol * 0.6:
+                vol_dried_up = True
+
+        # 11. 波幅收窄
+        atr10_recent = cls._w_atr(h[-10:], l[-10:], c[-10:], 10) if n >= 10 else 0
+        atr20_recent = cls._w_atr(h[-20:], l[-20:], c[-20:], 14) if n >= 20 else 0
+        atr30_hist = cls._w_atr(h[-30:], l[-30:], c[-30:], 14) if n >= 30 else 0
+        range_contract = (atr10_recent / atr20_recent <= 1.2) if atr20_recent > 0 else True
+        range_contract_tight = (atr10_recent / atr30_hist <= 0.85) if atr30_hist > 0 else False
+
+        # 12. 最近low是否未创新低
+        lo30 = float(np.min(l[-30:]))
+        lo10 = float(np.min(l[-10:]))
+        not_new_low = (lo10 >= lo30 * 0.995)
+
+        # 13. highs 是否依次降低
+        h_first = float(np.max(h[-10:-7])) if n >= 10 else 0
+        h_last  = float(np.max(h[-3:]))
+        highs_lowering = h_last < h_first * 0.97
+
+        return {
+            "pos": pos, "vol_ratio": vol_ratio, "v10": v10, "v50": v50, "v20": v20,
+            "support_tests": support_tests, "resistance_tests": resistance_tests,
+            "climax_idx": climax_idx, "vol_dried_up": vol_dried_up,
+            "lw_count": lw_count, "lw_10_count": int(np.sum([1 for i in range(-10, 0)
+                if not (limit_up[i] or limit_down[i])  # 排除一字板
+                and (min(c[i], o[i]) - l[i]) / max(h[i] - l[i], 0.001) > 0.3])),
+            "uw_count": uw_count, "avg_lw": avg_lw, "avg_uw": avg_uw,
+            "ma50": ma50, "ma200": ma200, "ma_gap": ma_gap, "above_ma50": above_ma50,
+            "atr_trend": atr_trend, "range_contract": range_contract,
+            "range_contract_tight": range_contract_tight,
+            "not_new_low": not_new_low, "highs_lowering": highs_lowering,
+            "r_hi": r_hi, "r_lo": r_lo,
+            "limit_up_10d": limit_up_10d, "limit_down_10d": limit_down_10d,
+        }
+
+    @classmethod
+    def classify_phase(cls, closes, highs, lows, opens, volumes,
+                       events=None):
         """
-        返回该股票所有威科夫信号，按得分降序排列。
+        纯价量驱动的威科夫阶段分类器。
+        不依赖 MA 交叉，仅用价格行为、量能、影线判断。
+
+        Args:
+            closes/highs/lows/opens/volumes: 日线数组（numpy 或 list）
+            events: [(signal_name, score), ...] 如 [("Spring", 65), ("SOS", 70)]
+
+        Returns:
+            (phase_label, confidence, description)
+
+        判定规则: 每个阶段有强制性必须满足的条件(hard gates)。
+        不满足任何必要条件→跳过该阶段。conf < 40 → 降级为 Range。
+        """
+        if events is None:
+            events = []
+        event_names = {e[0] if isinstance(e, (tuple, list)) else str(e)
+                       for e in events}
+
+        f = cls._phase_features(closes, highs, lows, opens, volumes)
+        if f is None:
+            return ("数据不足", 0, "K线<60根")
+
+        pos = f["pos"]
+        vol_ratio = f["vol_ratio"]
+        supp = f["support_tests"]
+        resis = f["resistance_tests"]
+        has_climax = f["climax_idx"] != -1  # -1 表示没找到，其他值表示有
+        dried = f["vol_dried_up"]
+        lw_c = f["lw_count"]
+        lw_10 = f["lw_10_count"]
+        uw_c = f["uw_count"]
+        ma_gap = f["ma_gap"]
+        above = f["above_ma50"]
+        atr = f["atr_trend"]
+        contr = f["range_contract"]
+        contr_tight = f["range_contract_tight"]
+        no_new_lo = f["not_new_low"]
+        hi_down = f["highs_lowering"]
+        climax_at = f["climax_idx"]
+
+        def _conf(core_ok, core_total, bonus_ok, bonus_total):
+            raw = int((core_ok / core_total) * 60 + (bonus_ok / max(1, bonus_total)) * 40)
+            return max(10, min(100, raw))
+
+        desc = f"pos={pos:.0f}% vol={vol_ratio:.2f} supp={supp}次 lw={lw_c} uw={uw_c} " \
+               f"ma_gap={ma_gap:.0f}% atr_tr={atr:.2f}"
+
+        # ═══════════════════════════════════════════
+        # 1. Markdown — 下降趋势
+        # ═══════════════════════════════════════════
+        md_core = [
+            (pos <= 20, pos <= 20),
+            (ma_gap is not None and (ma_gap < 5 or pos < 8), f"MA弱/死叉(gap={ma_gap:.0f}%)"),
+            (not above, not above),
+        ]
+        md_has_accum = (supp >= 3 and lw_c >= 4 and vol_ratio <= 1.1 and atr <= 1.2)
+        if all(v for v, _ in md_core) and not md_has_accum:
+            md_bonus = [hi_down, not any("Spring" in n for n in event_names), atr >= 1.0]
+            conf = _conf(len(md_core), len(md_core), sum(md_bonus), len(md_bonus))
+            if conf >= 40:
+                return ("Markdown", conf, desc + " 下降趋势")
+
+        # ═══════════════════════════════════════════
+        # 2. Markup — 主升段
+        # ═══════════════════════════════════════════
+        mu_core = [
+            (pos >= 70, pos >= 70),
+            (above, above),
+            (ma_gap is not None and ma_gap > 0, ma_gap is not None and ma_gap > 0),
+        ]
+        if all(v for v, _ in mu_core):
+            mu_bonus = [
+                vol_ratio >= 0.9,
+                any("SOS" in n for n in event_names),
+                uw_c <= 5,
+                atr >= 1.0,
+            ]
+            conf = _conf(len(mu_core), len(mu_core), sum(mu_bonus), len(mu_bonus))
+            if conf >= 40:
+                return ("Markup", conf, desc + " 主升段")
+
+        # ═══════════════════════════════════════════
+        # 3. Accum_A — 止跌 (Selling Climax + 自动反弹)
+        # ═══════════════════════════════════════════
+        aa_core = [
+            (pos <= 35, pos <= 35),
+            (has_climax, has_climax),
+        ]
+        if all(v for v, _ in aa_core):
+            aa_bonus = [dried, lw_10 >= 3, vol_ratio <= 0.9]
+            conf = _conf(len(aa_core), len(aa_core), sum(aa_bonus), len(aa_bonus))
+            if conf >= 40:
+                return ("Accum_A", conf, desc + " 止跌(SC+反弹)")
+
+        # ═══════════════════════════════════════════
+        # 4. Accum_B — 吸筹区间
+        # ═══════════════════════════════════════════
+        ab_core = [
+            (pos <= 45, pos <= 45),
+            (vol_ratio <= 1.2, vol_ratio <= 1.2),
+            (supp >= 3, supp >= 3),
+            (lw_c >= 3, lw_c >= 3),
+            (not hi_down or not above, True),  # 不处于下降加速
+        ]
+        if all(v for v, _ in ab_core):
+            ab_bonus = [
+                lw_c >= 5,
+                contr,
+                any("Spring" in n for n in event_names),
+                abs(ma_gap) < 15 if ma_gap is not None else True,
+            ]
+            conf = _conf(len(ab_core), len(ab_core), sum(ab_bonus), len(ab_bonus))
+            if conf >= 40:
+                return ("Accum_B", conf, desc + " 吸筹区间")
+
+        # ═══════════════════════════════════════════
+        # 5. Accum_C — 最后回踩（缩量测试）
+        # ═══════════════════════════════════════════
+        ac_core = [
+            (pos <= 35, pos <= 35),
+            (vol_ratio <= 0.75, vol_ratio <= 0.75),
+            (no_new_lo, no_new_lo),
+        ]
+        if all(v for v, _ in ac_core):
+            ac_bonus = [
+                contr_tight,
+                lw_c >= 5,
+                abs(ma_gap) < 8 if ma_gap is not None else True,
+            ]
+            conf = _conf(len(ac_core), len(ac_core), sum(ac_bonus), len(ac_bonus))
+            if conf >= 40:
+                return ("Accum_C", conf, desc + " 最后回踩(缩量测试)")
+
+        # ═══════════════════════════════════════════
+        # 6. Distribute_A — 派发初期（Buying Climax）
+        # ═══════════════════════════════════════════
+        hi_stifled = False
+        if climax_at != -1:  # 有高潮柱
+            hi_after = float(np.max(highs[climax_at:])) if abs(climax_at) <= len(highs) else 0
+            hi_stifled = hi_after <= f["r_hi"] * 0.99
+        da_core = [
+            (pos >= 65, pos >= 65),
+            (has_climax, has_climax),
+        ]
+        if all(v for v, _ in da_core):
+            da_bonus = [
+                hi_stifled,
+                uw_c >= 5,
+                vol_ratio > 1.0,
+                any("Upthrust" in n for n in event_names),
+            ]
+            conf = _conf(len(da_core), len(da_core), sum(da_bonus), len(da_bonus))
+            if conf >= 40:
+                return ("Distribute_A", conf, desc + " 派发初期(BC)")
+
+        # ═══════════════════════════════════════════
+        # 7. Distribute_B — 派发区间
+        # ═══════════════════════════════════════════
+        db_core = [
+            (pos >= 50, pos >= 50),
+            (uw_c >= 5, uw_c >= 5),
+        ]
+        if all(v for v, _ in db_core):
+            db_bonus = [
+                vol_ratio >= 1.1,
+                resis >= 3,
+                ma_gap is not None and ma_gap <= 5,
+                any("Upthrust" in n for n in event_names),
+                atr > 1.2,
+            ]
+            conf = _conf(len(db_core), len(db_core), sum(db_bonus), len(db_bonus))
+            if conf >= 40:
+                return ("Distribute_B", conf, desc + " 派发区间")
+
+        # ═══════════════════════════════════════════
+        # 8. Range — 中性区间（含方向提示）
+        # ═══════════════════════════════════════════
+        hint = ""
+        if pos <= 45 and supp >= 2 and vol_ratio <= 1.1:
+            hint = " 偏吸筹"
+        elif pos >= 65 and uw_c >= 4:
+            hint = " 偏派发"
+        elif above and (ma_gap is not None and ma_gap > 0):
+            hint = " 偏多"
+        elif not above:
+            hint = " 偏空"
+        return ("Range", max(20, int(50 - abs(pos - 50) / 2)), desc + hint)
+
+    @classmethod
+    def analyze_all(cls, closes, highs, lows, opens, volumes):
+        """
+        返回该股票所有威科夫信号（全量检测，不做阶段过滤）。
+        将 opens 传入以备 classify_phase 使用。
         return: (signals list, extra dict with accum_stage/markup)
         """
         if len(closes) < 30:
@@ -118,43 +509,43 @@ class WyckoffAnalyzer:
 
         signals = []
 
-        # ---- 1. Spring 弹簧 ----
-        sig = cls.detect_spring(closes, highs, lows, volumes, trend)
+        # ---- Spring 弹簧（两套参数集取高分）----
+        sig = cls.detect_spring(closes, highs, lows, volumes)
         if sig:
             signals.append(sig)
 
-        # ---- 2. SOS 强势信号 ----
-        sig = cls.detect_sos(closes, highs, lows, volumes, trend)
+        # ---- SOS 强势信号 ----
+        sig = cls.detect_sos(closes, highs, lows, volumes)
         if sig:
             signals.append(sig)
 
-        # ---- 3. LPS 最后支撑点 ----
-        sig = cls.detect_lps(closes, highs, lows, volumes, trend)
+        # ---- LPS 最后支撑点 ----
+        sig = cls.detect_lps(closes, highs, lows, volumes)
         if sig:
             signals.append(sig)
 
-        # ---- 4. Upthrust 上冲回落 ----
-        sig = cls.detect_upthrust(closes, highs, lows, volumes, trend)
+        # ---- Upthrust 上冲回落 ----
+        sig = cls.detect_upthrust(closes, highs, lows, volumes)
         if sig:
             signals.append(sig)
 
-        # ---- 5. EVR 努力无结果 ----
-        sig = cls.detect_evr(closes, highs, lows, volumes, trend)
+        # ---- EVR 努力无结果 ----
+        sig = cls.detect_evr(closes, highs, lows, volumes)
         if sig:
             signals.append(sig)
 
-        # ---- 6. Compression 压缩蓄势 ----
-        sig = cls.detect_compression(closes, highs, lows, volumes, trend)
+        # ---- Compression 压缩蓄势 ----
+        sig = cls.detect_compression(closes, highs, lows, volumes)
         if sig:
             signals.append(sig)
 
         # ---- 额外信息 ----
         extra = {}
-        sig = cls.detect_accum_stage(closes, highs, lows, volumes, trend)
+        sig = cls.detect_accum_stage(closes, highs, lows, volumes)
         if sig:
             extra["accum_stage"] = sig
 
-        sig = cls.detect_markup(closes, highs, lows, volumes, trend)
+        sig = cls.detect_markup(closes, highs, lows, volumes)
         if sig:
             extra["markup"] = sig
 
@@ -163,94 +554,248 @@ class WyckoffAnalyzer:
         return signals, extra
 
     # -------------------------------------------------------
-    # Spring 弹簧
+    # Spring 弹簧（v3 — 第一性原理重写）
     # -------------------------------------------------------
+    @staticmethod
+    def _find_support_zone(closes, highs, lows, window=30, min_touches=2, percentile=20, zone_pct=2.0):
+        """
+        从交易区间中寻找支撑区域（不是最低点，是价格区间底部）。
+
+        Wyckoff 第一性原理：支撑是需求战胜供给的**区域**，不是单条线。
+        区间需要多次测试才确认有效。
+
+        返回:
+            (support_level, touch_count, range_width_pct, is_valid)
+        """
+        if len(lows) < window:
+            return (None, 0, 0, False)
+
+        recent_lows = lows[-window:]
+        recent_highs = highs[-window:]
+
+        # 支撑 = 20% 分位数（剔除毛刺/恐慌低点）
+        support = float(np.percentile(recent_lows, percentile))
+        if support <= 0:
+            return (None, 0, 0, False)
+
+        # 测试次数：low 在支撑附近 ±zone_pct% 内的次数
+        touches = sum(1 for l in recent_lows
+                      if abs(l - support) / support * 100 < zone_pct)
+
+        # 区间上沿 = 80% 分位数（剔除极端高点）
+        range_top = float(np.percentile(recent_highs, 80))
+        range_width = (range_top - support) / support * 100 if support > 0 else 0
+
+        # 有效条件：有多次测试 + 区间有足够宽度（否则是横盘/死水）
+        is_valid = touches >= min_touches and range_width >= 2.0
+
+        return (support, touches, range_width, is_valid)
+
     @classmethod
-    def detect_spring(cls, closes, highs, lows, volumes, trend):
-        """弹簧：价格跌破近期支撑，快速收回，伴随放量"""
-        cfg = cls._cfg("spring")
-        if not cfg.get("enabled", True) or trend in cfg.get("exclude_trends", ["空头", "错误"]):
-            return None
-        sw = cfg.get("support_window", [-12, -3])
-        pr = cfg.get("price_range", [0.95, 1.15])
-        vbw = cfg.get("volume_baseline_window", [-15, -3])
-        dw = cfg.get("detect_window", [-3, None])
+    def _detect_spring_core(cls, closes, highs, lows, volumes,
+                            support, touches, range_width,
+                            config_section="spring"):
+        """
+        Spring 核心检测逻辑，参数化可同时用于多头/空头。
+
+        关键修复：
+        1. 不双重计算（深度×弹跳）。改用"收盘在区间中的位置"评分
+        2. 浅探 = 高分（卖压枯竭），深探 = 低分/扣分
+        3. 量能用 Spring 后趋势判断，不用单日量比
+        4. 支撑质量基于测试次数，不是 single min
+        """
+        cfg = cls._cfg(config_section)
+        dw = cfg.get("detect_window", [-10, None])
+        scoring = cfg.get("scoring", {})
         thr = cfg.get("thresholds", {})
+        max_pen = scoring.get("max_penetration", 10.0)
+        recovery_window = cfg.get("recovery_window", 3)
 
-        support = float(min(lows[sw[0]:sw[1]])) if len(lows) >= abs(sw[0]) else 1
-        cur = float(closes[-1])
-        if cur > support * pr[1] or cur < support * pr[0]:
-            return None
-
-        bg_vol = cls._avg(volumes[vbw[0]:vbw[1]])
         lookback = lows[dw[0]:dw[1]]
         closes_lb = closes[dw[0]:dw[1]]
-
-        scoring = cfg.get("scoring", {})
-        depth_cfg = scoring.get("depth", [])
-        vol_cfg = scoring.get("volume_ratio", [])
-        bounce_cfg = scoring.get("bounce", [])
-        nd_confirm = scoring.get("next_day_confirm", 15)
-
-        # ---- start_zone_check: 跌势起点位置（全局，循环外计算一次）-----
-        zone_bonus = 0
-        zone_label = ""
-        if len(closes) >= 11 and len(highs) >= 10:
-            start_price = float(closes[-11])   # 10日前收盘价 = 跌势起点
-            recent_10d_high = float(max(highs[-10:]))
-            zone_range = recent_10d_high - support
-            if zone_range > 0:
-                start_pct = (start_price - support) / zone_range * 100
-                if start_pct >= 30:
-                    zone_bonus = 5
-                    zone_label = f"起区{start_pct:.0f}%"
-                elif start_pct < 20:
-                    zone_bonus = -10
-                    zone_label = f"近撑{start_pct:.0f}%"
 
         best = None
         for i in range(len(lookback)):
             low = float(lookback[i])
             close = float(closes_lb[i])
-            vol = float(volumes[-3:][i]) if len(volumes) >= 3 else 1
 
-            if low >= support * 0.997 or close <= support:
+            penetration = (support - low) / support * 100
+            if penetration <= 0:
                 continue
 
-            depth = (support - low) / support * 100
-            vratio = vol / bg_vol if bg_vol > 0 else 1
-            bounce = (close - low) / low * 100
+            # --- 同日 Spring ---
+            if close > support:
+                if penetration > max_pen:
+                    continue
+                deep_pen = penetration
+                recovery_close = close
+                delay = 0
+                multi_day = False
 
-            score = 0
+            # --- 多日 Spring ---
+            else:
+                recovery_day = -1
+                for j in range(i + 1, min(i + 1 + recovery_window, len(lookback))):
+                    if float(closes_lb[j]) > support:
+                        recovery_day = j
+                        break
+                if recovery_day < 0:
+                    continue
+                deep_pen = max(
+                    (support - float(lookback[k])) / support * 100
+                    for k in range(i, recovery_day + 1)
+                )
+                if deep_pen > max_pen:
+                    continue
+                recovery_close = float(closes_lb[recovery_day])
+                delay = recovery_day - i
+                multi_day = True
+            if penetration > max_pen:     # 穿透太深，不是 Spring
+                continue
+
             parts = []
-            for d in depth_cfg:
-                if depth >= d[0]: score += d[1]; parts.append(d[2].format(depth=depth)); break
-            for v in vol_cfg:
-                if vratio >= v[0]: score += v[1]; parts.append(v[2]); break
-            for b in bounce_cfg:
-                if bounce >= b[0]: score += b[1]; parts.append(b[2].format(bounce=bounce)); break
-            if i + 1 < len(closes_lb) and float(closes_lb[i+1]) > close:
-                score += nd_confirm; parts.append("确认")
+            score = 0
 
-            # 叠加 start_zone 评分
-            if zone_bonus != 0:
-                score += zone_bonus
-                parts.append(zone_label)
+            # 1. 收盘在区间中的位置 (0-30)
+            if range_width > 0:
+                close_in_range = (recovery_close - support) / (support * range_width / 100) * 100
+                if close_in_range >= 80:
+                    score += 30; parts.append(f"收高位({close_in_range:.0f}%)")
+                elif close_in_range >= 50:
+                    score += 22; parts.append(f"收中位({close_in_range:.0f}%)")
+                elif close_in_range >= 20:
+                    score += 12; parts.append(f"收低位({close_in_range:.0f}%)")
+                else:
+                    score += 0; parts.append("贴支撑")
+
+            # 2. 支撑质量 (0-25)
+            if touches >= 5:
+                score += 22; parts.append(f"强支撑({touches}次)")
+            elif touches >= 3:
+                score += 15; parts.append(f"支撑({touches}次)")
+            elif touches >= 2:
+                score += 5; parts.append(f"弱支撑({touches}次)")
+
+            # 3. 穿透深度 (0-15)
+            if deep_pen < 1.0:
+                score += 15; parts.append(f"浅探{deep_pen:.2f}%")
+            elif deep_pen < 3.0:
+                score += 10; parts.append(f"中探{deep_pen:.2f}%")
+            elif deep_pen < 5.0:
+                score += 5; parts.append(f"深探{deep_pen:.2f}%")
+            else:
+                score += 0; parts.append(f"猛跌{deep_pen:.2f}%")
+
+            # 多日弹簧扣分（迟收回 = 弱信号）
+            if multi_day:
+                delay_penalty = delay * 5
+                score -= delay_penalty
+                parts.append(f"迟{delay}天-{delay_penalty}")
+
+            # 4. 量能趋势 (0-20)：Spring 后量能递减 = 卖压枯竭
+            effective_idx = recovery_day if multi_day else i
+            spring_idx = -(len(lookback) - effective_idx)
+            # 取 Spring 后所有可用 K 线（上限 3 根），避免负→正索引空切片
+            post_vols = []
+            if spring_idx < -1:  # 至少还有 1 根后验
+                post_vols = volumes[spring_idx + 1:]  # 到末尾
+                if len(post_vols) > 3:
+                    post_vols = post_vols[:3]
+
+            vol_declining = (
+                len(post_vols) >= 2
+                and all(post_vols[j] <= post_vols[j-1] for j in range(1, len(post_vols)))
+            )
+            # Spring 当日量比
+            vol_i = float(volumes[spring_idx]) if spring_idx < 0 and abs(spring_idx) <= len(volumes) else 0
+            bg_vol = float(np.mean(volumes[-25:-5])) if len(volumes) >= 25 else 1
+            vratio = vol_i / bg_vol if bg_vol > 0 else 1
+
+            if vol_declining and vratio < 1.5:
+                score += 20; parts.append("缩量确认")
+            elif vol_declining:
+                score += 15; parts.append(f"放量+缩量(v{vratio:.1f}x)")
+            elif vratio > 2.0:
+                score += 8; parts.append(f"巨量(v{vratio:.1f}x)")
+            elif vratio > 1.2:
+                score += 5; parts.append(f"放量(v{vratio:.1f}x)")
+            else:
+                score += 3; parts.append(f"量平")
+
+            # 5. 次日确认 (0-15)
+            nd_idx = recovery_day if multi_day else i
+            nd_close = recovery_close if multi_day else close
+            if nd_idx + 1 < len(closes_lb) and float(closes_lb[nd_idx + 1]) > nd_close:
+                score += 15; parts.append("确认")
 
             if score > (best[1] if best else 0):
-                sig = "Spring" if score >= thr.get("strong_signal", 55) else thr.get("weak_label", "弱Spring")
+                sig = "Spring" if score >= thr.get("strong_signal", 60) else thr.get("weak_label", "弱Spring")
                 best = (sig, score, " | ".join(parts))
 
         return best
+
+    @classmethod
+    def detect_spring(cls, closes, highs, lows, volumes, trend=""):
+        """
+        Spring 检测。内部运行两套参数集取高分：
+        - 标准：30d / 20%ile / 2次支撑 / 10%穿透
+        - 严格：45d / 15%ile / 3次支撑 / 8%穿透 + 评分×0.8
+        后者在 Markdown 阶段有更多假信号，故用更严条件过滤。
+        """
+        cfg = cls._cfg("spring")
+        if not cfg.get("enabled", True):
+            return None
+
+        # 第1套：标准参数
+        sw = cfg.get("support_window", 30)
+        result1 = None
+        support, touches, range_width, valid = cls._find_support_zone(
+            closes, highs, lows, window=sw,
+            min_touches=cfg.get("min_touches", 2),
+        )
+        if valid:
+            result1 = cls._detect_spring_core(
+                closes, highs, lows, volumes,
+                support, touches, range_width,
+                config_section="spring",
+            )
+
+        # 第2套：严格参数（长窗口/多测试/低分位 + 折扣）
+        strict_sw = cfg.get("strict_support_window", 45)
+        result2 = None
+        support2, touches2, rw2, valid2 = cls._find_support_zone(
+            closes, highs, lows, window=strict_sw,
+            min_touches=cfg.get("strict_min_touches", 3),
+            percentile=cfg.get("strict_percentile", 15),
+        )
+        if valid2:
+            r2 = cls._detect_spring_core(
+                closes, highs, lows, volumes,
+                support2, touches2, rw2,
+                config_section="spring",
+            )
+            if r2:
+                sig, score, detail = r2
+                score = int(score * 0.8)
+                sig = "Spring" if score >= cfg.get("thresholds", {}).get("strong_signal", 60) else "弱Spring"
+                result2 = (sig, score, detail + " [严格]")
+
+        if not result1 and not result2:
+            return None
+        if not result1:
+            return result2
+        if not result2:
+            return result1
+        return result1 if result1[1] >= result2[1] else result2
 
     # -------------------------------------------------------
     # SOS Sign of Strength 强势信号
     # -------------------------------------------------------
     @classmethod
-    def detect_sos(cls, closes, highs, lows, volumes, trend):
+    def detect_sos(cls, closes, highs, lows, volumes, trend=""):
         """强势信号：大阳线 + 放量 + 高位收盘"""
         cfg = cls._cfg("sos")
-        if not cfg.get("enabled", True) or trend in cfg.get("exclude_trends", ["空头"]):
+        if not cfg.get("enabled", True):
             return None
         if len(closes) < cfg.get("min_bars", 50):
             return None
@@ -259,7 +804,7 @@ class WyckoffAnalyzer:
         mp = cfg.get("ma200_bias_protection", {})
         if mp.get("enabled", True) and len(closes) >= 200:
             ma50 = float(np.mean(closes[-50:]))
-            ma200 = float(np.mean(closes))
+            ma200 = float(np.mean(closes[-200:]))
             if ma200 > 0 and (ma50 - ma200) / ma200 * 100 > mp.get("max_bias_pct", 25):
                 return None
 
@@ -314,10 +859,10 @@ class WyckoffAnalyzer:
     # LPS Last Point of Support 最后支撑点
     # -------------------------------------------------------
     @classmethod
-    def detect_lps(cls, closes, highs, lows, volumes, trend):
+    def detect_lps(cls, closes, highs, lows, volumes, trend=""):
         """最后支撑点：放量上攻后，缩量回调至支撑附近"""
         cfg = cls._cfg("lps")
-        if not cfg.get("enabled", True) or trend in cfg.get("exclude_trends", ["空头"]):
+        if not cfg.get("enabled", True):
             return None
         if len(closes) < cfg.get("min_bars", 30):
             return None
@@ -331,9 +876,14 @@ class WyckoffAnalyzer:
         scoring = cfg.get("scoring", {})
         thr = cfg.get("thresholds", {})
 
-        support = float(min(lows[sw[0]:sw[1]]))
+        support_level, touches, _, valid = cls._find_support_zone(
+            closes, highs, lows, window=abs(sw[0] - sw[1]),
+            min_touches=1, zone_pct=2.0,
+        )
+        if not valid:
+            return None
         cur = float(closes[-1])
-        if not (support * pr[0] <= cur <= support * pr[1]):
+        if not (support_level * 0.99 <= cur <= support_level * pr[1]):
             return None
 
         # 前置放量上涨检测
@@ -368,14 +918,18 @@ class WyckoffAnalyzer:
                 score += b[1]; parts.append(b[2]); break
 
         st_win = scoring.get("support_tested_window", [-15, 0])
-        if any(float(lows[i]) < support and float(closes[i]) > support for i in range(st_win[0], st_win[1] or 0)):
+        if any(float(lows[i]) < support_level and float(closes[i]) > support_level for i in range(st_win[0], st_win[1] or 0)):
             score += scoring.get("support_tested_score", 15); parts.append("支撑验证")
 
         rn = scoring.get("range_narrowing", {})
         if rn:
             rnw = rn.get("window", [-10, -5, -5, 0])
-            recent_r = float(max(highs[rnw[2]:rnw[3]])) - float(min(lows[rnw[2]:rnw[3]]))
-            older_r = float(max(highs[rnw[0]:rnw[1]])) - float(min(lows[rnw[0]:rnw[1]]))
+            recent = highs[rnw[2]:rnw[3]]
+            older = highs[rnw[0]:rnw[1]]
+            if len(recent) == 0 or len(older) == 0:
+                return None
+            recent_r = float(max(recent)) - float(min(lows[rnw[2]:rnw[3]]))
+            older_r = float(max(older)) - float(min(lows[rnw[0]:rnw[1]]))
             if older_r > 0 and recent_r < older_r * rn.get("ratio_threshold", 0.7):
                 score += rn.get("score", 10); parts.append("波幅收窄")
 
@@ -387,10 +941,10 @@ class WyckoffAnalyzer:
     # Upthrust 上冲回落（UT/UTAD）
     # -------------------------------------------------------
     @classmethod
-    def detect_upthrust(cls, closes, highs, lows, volumes, trend):
+    def detect_upthrust(cls, closes, highs, lows, volumes, trend=""):
         """上冲回落：价格突破阻力后迅速收回，放量"""
         cfg = cls._cfg("upthrust")
-        if not cfg.get("enabled", True) or trend in cfg.get("exclude_trends", ["空头"]):
+        if not cfg.get("enabled", True):
             return None
         if len(closes) < cfg.get("min_bars", 20):
             return None
@@ -402,7 +956,8 @@ class WyckoffAnalyzer:
         scoring = cfg.get("scoring", {})
         thr = cfg.get("thresholds", {})
 
-        resistance = float(max(highs[rw[0]:rw[1]]))
+        # 阻力区域（80%分位数），剔除毛刺最高点
+        resistance = float(np.percentile(highs[rw[0]:rw[1]], 80))
         if resistance <= 0:
             return None
 
@@ -466,17 +1021,17 @@ class WyckoffAnalyzer:
     # EVR Effort vs Result 努力无结果
     # -------------------------------------------------------
     @classmethod
-    def detect_evr(cls, closes, highs, lows, volumes, trend):
+    def detect_evr(cls, closes, highs, lows, volumes, trend=""):
         """努力无结果：放量但价格窄幅波动"""
         cfg = cls._cfg("evr")
-        if not cfg.get("enabled", True) or trend in cfg.get("exclude_trends", ["空头", "错误"]):
+        if not cfg.get("enabled", True):
             return None
         if len(closes) < cfg.get("min_bars", 30):
             return None
 
         mp = cfg.get("ma200_bias_protection", {})
         if mp.get("enabled", True) and len(closes) >= 200:
-            ma200 = float(np.mean(closes))
+            ma200 = float(np.mean(closes[-200:]))
             if ma200 > 0 and (float(closes[-1]) - ma200) / ma200 > mp.get("max_bias_pct", 30) / 100:
                 return None
 
@@ -524,10 +1079,10 @@ class WyckoffAnalyzer:
     # Compression 压缩蓄势
     # -------------------------------------------------------
     @classmethod
-    def detect_compression(cls, closes, highs, lows, volumes, trend):
+    def detect_compression(cls, closes, highs, lows, volumes, trend=""):
         """压缩蓄势：ATR 收窄 + 缩量，变盘前夜"""
         cfg = cls._cfg("compression")
-        if not cfg.get("enabled", True) or trend in cfg.get("exclude_trends", ["错误"]):
+        if not cfg.get("enabled", True):
             return None
         if len(closes) < cfg.get("min_bars", 40):
             return None
@@ -594,10 +1149,10 @@ class WyckoffAnalyzer:
     # Markup 阶段确认（MA50上穿MA200）
     # -------------------------------------------------------
     @classmethod
-    def detect_markup(cls, closes, highs, lows, volumes, trend):
+    def detect_markup(cls, closes, highs, lows, volumes, trend=""):
         """Markup 主升段：MA50 上穿 MA200 且保持在上方 N 日"""
         cfg = cls._cfg("markup")
-        if not cfg.get("enabled", True) or trend in cfg.get("exclude_trends", ["空头"]):
+        if not cfg.get("enabled", True):
             return None
         if len(closes) < cfg.get("min_bars", 210):
             return None
@@ -653,7 +1208,7 @@ class WyckoffAnalyzer:
     # 缠论第三类买点 — 执行层信号
     # -------------------------------------------------------
     @classmethod
-    def detect_chan_third_buy(cls, closes, highs, lows, volumes, trend):
+    def detect_chan_third_buy(cls, closes, highs, lows, volumes, phase=""):
         """
         缠论第三类买点检测：中枢形成 → 突破上沿 → 回踩不进入
 
@@ -662,7 +1217,7 @@ class WyckoffAnalyzer:
         第一次回踩不重新进入中枢 = 确认趋势延续的最佳入场点。
         """
         cfg = cls._cfg("chan_third_buy")
-        if not cfg.get("enabled", True) or trend in cfg.get("exclude_trends", ["空头", "错误"]):
+        if not cfg.get("enabled", True):
             return None
         if len(closes) < cfg.get("min_bars", 60):
             return None
@@ -789,8 +1344,8 @@ class WyckoffAnalyzer:
                         parts.append(r[2])
                     break
 
-            # 多头趋势确认
-            if trend == "多头":
+            # 上升阶段确认（Markup / Accum_B / Accum_C）
+            if phase in ("Markup", "Accum_B", "Accum_C"):
                 score += scoring.get("bull_trend_bonus", 10)
                 parts.append("多头趋势")
 
@@ -819,10 +1374,10 @@ class WyckoffAnalyzer:
     # Accumulation ABC 子阶段
     # -------------------------------------------------------
     @classmethod
-    def detect_accum_stage(cls, closes, highs, lows, volumes, trend):
+    def detect_accum_stage(cls, closes, highs, lows, volumes, trend=""):
         """吸筹期子阶段细分：A 止跌 / B 探底 / C 回踩"""
         cfg = cls._cfg("accumulation")
-        if not cfg.get("enabled", True) or trend in cfg.get("exclude_trends", ["空头", "错误"]):
+        if not cfg.get("enabled", True):
             return None
         if len(closes) < cfg.get("min_bars", 60):
             return None
@@ -837,7 +1392,7 @@ class WyckoffAnalyzer:
         accum_base_low = low_250d
         max_ma_gap = cfg.get("max_ma_gap_pct", 8)
         ma50 = float(np.mean(closes[-50:])) if len(closes) >= 50 else 0
-        ma200 = float(np.mean(closes)) if len(closes) >= 200 else 0
+        ma200 = float(np.mean(closes[-200:])) if len(closes) >= 200 else 0
         if ma200 > 0:
             ma_gap = abs(ma50 - ma200) / ma200 * 100
             if ma_gap > max_ma_gap:
@@ -896,103 +1451,18 @@ class WyckoffAnalyzer:
     # Phase A-E 威科夫价格周期阶段识别
     # -------------------------------------------------------
     @classmethod
-    def detect_phase(cls, closes, highs, lows, volumes, trend, events, extra=None):
+    def detect_phase(cls, closes, highs, lows, volumes, trend=None, events=None, extra=None):
         """
-        将检测到的威科夫事件归类到价格周期阶段（Phase A-E）。
-        利用 Accum ABC / Markup 做更细粒度判断。
-        return: (phase_label, description, confidence)
+        委托 classify_phase() — 纯价量驱动的威科夫阶段识别。
+        保留旧签名兼容外部调用（backtest/scoring 等 10+ 处）。
+
+        return: (phase_label, description, confidence)  — 旧版格式
         """
-        cf = cls._cfg("phase")
-        min_bars = cf.get("min_bars", 50)
-        if extra is None:
-            extra = {}
-        if len(closes) < min_bars:
-            return ("数据不足", "", 0)
-
-        cur = float(closes[-1])
-        ma50 = float(np.mean(closes[-50:]))
-        ma200 = float(np.mean(closes)) if len(closes) >= 200 else 0
-        rw = cf.get("range_window", 60)
-        bt = cf.get("breakout_threshold", 1.0) / 100
-
-        range_high = float(max(highs[-rw:]))
-        range_low = float(min(lows[-rw:]))
-        above_range = cur > range_high * (1 + bt)
-        below_range = cur < range_low * (1 - bt)
-        in_range = not above_range and not below_range
-
-        vs = cf.get("vol_state", {})
-        avg_vol_50 = float(np.mean(volumes[-50:])) if len(volumes) >= 50 else 1
-        avg_vol_10 = float(np.mean(volumes[-10:])) if len(volumes) >= 10 else 1
-        if avg_vol_10 < avg_vol_50 * vs.get("shrink_ratio", 0.7):
-            vol_state = "缩量"
-        elif avg_vol_10 > avg_vol_50 * vs.get("expand_ratio", 1.3):
-            vol_state = "放量"
-        else:
-            vol_state = "量平"
-
-        et = set(e[0] for e in events if e[1] > 0)
-        has_sos      = "SOS" in et
-        has_lps      = "LPS" in et
-        has_spring   = any("Spring" in e for e in et)
-        has_upthrust = "Upthrust" in et
-        has_evr      = "EVR" in et
-        has_compression = "Compression" in et
-        extra_accum = extra.get("accum_stage")
-        extra_markup = extra.get("markup")
-        conf = cf.get("confidence", {})
-        pb = cf.get("phase_b", {})
-        range_size = (range_high - range_low) / range_low * 100 if range_low > 0 else 0
-
-        if trend == "多头":
-            if extra_markup:
-                return (f"Phase D→E — Markup主升段",
-                        f"MA50上穿MA200确认，趋势强度{extra_markup[1]}，{vol_state}，多头主导",
-                        conf.get("markup", 88))
-            if has_sos:
-                label = "Phase D→E — 突破确认/上升趋势" if above_range else "Phase D — SOS强势信号确认"
-                detail = (f"价格突破区间{range_low:.1f}-{range_high:.1f}，SOS信号确认，多头主导"
-                          if above_range else
-                          f"SOS出现，价格在区间{range_low:.1f}-{range_high:.1f}内整理，{vol_state}，等待突破")
-                return (label, detail, conf.get("sos_breakout" if above_range else "sos_in_range", 85))
-            if above_range:
-                return ("Phase E — 上升趋势中",
-                        f"均线多头排列({ma50/ma200-1:+.1%})，沿趋势运行" if ma200 > 0 else "多头趋势运行",
-                        conf.get("trend_up", 82))
-            if in_range and has_lps:
-                return ("Phase D — LPS最后支撑点", "缩量回调至支撑附近，最佳入场区域", conf.get("lps", 85))
-            if in_range and has_spring:
-                return ("Phase C — Spring弹簧确认", "支撑位附近探底回升，底部确认", conf.get("spring", 85))
-            if in_range and has_compression:
-                return ("Phase B→C — 压缩蓄势",
-                        f"波动率收窄+缩量，变盘前夜，{vol_state}", conf.get("compression", 80))
-            if in_range and extra_accum:
-                sn = {"Accum_A": "A(止跌缩量)", "Accum_B": "B(探底测试)", "Accum_C": "C(最后回踩)"}
-                return (f"Phase A→B — 吸筹{sn.get(extra_accum[0], extra_accum[0])}",
-                        f"价格在{range_low:.1f}-{range_high:.1f}整理，{vol_state}，{extra_accum[2]}",
-                        conf.get("accum", 72))
-            if in_range:
-                if range_size < pb.get("max_range_size_pct", 20):
-                    return ("Phase B — 吸筹区间震荡",
-                            f"价格在{range_low:.1f}-{range_high:.1f}整理，{vol_state}，蓄力待发",
-                            conf.get("phase_b", 72))
-                return ("Phase A→B — 吸筹筑底期",
-                        f"均线走平，{vol_state}，关注区间方向选择", conf.get("phase_b_build", 65))
-
-        elif trend == "空头":
-            if below_range:
-                return ("Phase E — 下降趋势中", "空头主导，不宜做多，等待底部结构形成", conf.get("downtrend", 80))
-            if in_range and has_upthrust:
-                return ("Phase C — Upthrust上冲回落",
-                        "突破阻力后收回，派发特征，警惕进一步下跌", conf.get("upthrust_in_range", 85))
-            if in_range:
-                return ("Phase B — 派发区间震荡",
-                        f"价格反弹受阻，{vol_state}，注意二次探底风险", conf.get("distribute", 68))
-            return ("Phase A — 派发初期",
-                    "高位滞涨，供应开始出现，注意趋势转变", conf.get("distribute_early", 60))
-
-        return ("Phase B — 区间整理",
-                f"均线交织，价格在{range_low:.1f}-{range_high:.1f}区间波动", conf.get("range_trade", 55))
+        opens = (extra or {}).get("opens") if isinstance(extra, dict) else None
+        if opens is None:
+            opens = closes  # 近似：opens≈closes（影线计算受影响但阶段分类正常）
+        phase, conf, desc = cls.classify_phase(closes, highs, lows, opens, volumes, events or [])
+        return (phase, desc, conf)
 
 
 # ============================================================
@@ -1067,33 +1537,47 @@ class Scanner:
     # ==================== 获取全市场数据 ====================
 
     @staticmethod
-    def _fetch_page(page, num=100, timeout=20, node="hs_a"):
+    def _fetch_page(page, num=100, timeout=10, node="hs_a"):
         params = {"page": page, "num": num, "sort": "symbol",
                   "asc": "1", "node": node, "_s_r_a": "init"}
-        r = requests.get(Scanner.SINA_HQ_URL, params=params, timeout=timeout)
-        return r.json()
+        try:
+            r = requests.get(Scanner.SINA_HQ_URL, params=params, timeout=timeout)
+            return r.json()
+        except Exception:
+            return None
 
     def fetch_all_stocks(self, max_pages=None):
         fc = self._sc.get("fetch", {})
         max_pages = max_pages or fc.get("max_pages", 80)
         page_size = fc.get("page_size", 100)
         workers = fc.get("thread_pool", 15)
-        timeout = fc.get("request_timeout", 20)
+        timeout = fc.get("request_timeout", 10)
         all_data = []
+        # 全局超时：Sina API 超过 45 秒无有效数据就走 AKShare 兜底
+        SINA_DEADLINE = 45
+        fetch_start = time.time()
         # 同时获取沪市(sh_a)和深市(sz_a)，hs_a已改为仅北交所
         for node in ("sh_a", "sz_a"):
+            if time.time() - fetch_start > SINA_DEADLINE:
+                break
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 pages_per_exchange = max(30, max_pages // 2)
                 futures = {}
                 for p in range(1, pages_per_exchange + 1):
                     futures[pool.submit(self._fetch_page, p, page_size, timeout, node)] = p
-                for f in as_completed(futures):
-                    try:
-                        data = f.result()
-                        if data:
-                            all_data.extend(data)
-                    except Exception:
-                        pass
+                try:
+                    remaining = max(5, SINA_DEADLINE - (time.time() - fetch_start))
+                    for f in as_completed(futures, timeout=remaining):
+                        try:
+                            data = f.result()
+                            if data:
+                                all_data.extend(data)
+                        except Exception:
+                            pass
+                        if time.time() - fetch_start > SINA_DEADLINE:
+                            break
+                except Exception:
+                    pass
 
         stocks, snapshot = [], {}
         if all_data:
@@ -1189,9 +1673,10 @@ class Scanner:
             klines = data.get("data", {}).get(key, {}).get("qfqday") or \
                      data.get("data", {}).get(key, {}).get("day") or []
 
-            closes, highs, lows, volumes = [], [], [], []
+            closes, highs, lows, volumes, opens = [], [], [], [], []
             for k in klines:
                 try:
+                    opens.append(float(k[1]))
                     closes.append(float(k[2]))
                     highs.append(float(k[3]))
                     lows.append(float(k[4]))
@@ -1199,37 +1684,65 @@ class Scanner:
                 except (ValueError, IndexError):
                     pass
 
-            # 趋势判断
+            # 趋势判断（保留向后兼容）
             if len(closes) >= 200:
                 ma50 = np.mean(closes[-50:])
-                ma200 = np.mean(closes)
+                ma200 = np.mean(closes[-200:])
                 s = (ma50 / ma200 - 1) * 100
                 result["trend"] = "多头" if ma50 > ma200 else "空头"
                 result["strength"] = round(s, 1)
+                # 三重滤网: 月线(MA200≈10月线) / 周线(MA50≈10周线) / 日线(MA20)
+                price = closes[-1]
+                ma20 = np.mean(closes[-20:])
+                result["tf_monthly"] = "多" if price > ma200 else "空"
+                result["tf_weekly"] = "多" if price > ma50 else "空"
+                result["tf_daily"] = "多" if price > ma20 else "空"
+                result["tf_score"] = int(price > ma200) + int(price > ma50) + int(price > ma20)
             elif len(closes) >= 50:
                 result["trend"] = "数据不足"
             else:
                 result["trend"] = "新股"
 
-            # 威科夫形态分析
+            # ─── 三步管道：全量信号 → classify_phase → 阶段过滤 ───
+            # 第1步：analyze_all 返回所有信号（不过滤）
             signals = []
             extra_info = {}
             if len(closes) >= 30:
                 signals, extra_info = WyckoffAnalyzer.analyze_all(
-                    closes, highs, lows, volumes, trend=result["trend"]
+                    closes, highs, lows, opens, volumes
                 )
-                if signals and signals[0][1] > 0:
-                    result["wyckoff_sig"] = signals[0][0]
-                    result["wyckoff_score"] = signals[0][1]
-                    result["wyckoff_detail"] = signals[0][2]
 
-            # 威科夫阶段识别
-            if len(closes) >= 50:
-                phase, phase_detail, _ = WyckoffAnalyzer.detect_phase(
-                    closes, highs, lows, volumes, result["trend"], signals, extra_info
+            # 第2步：classify_phase 确定阶段（用 signals 做 bonus）
+            if len(closes) >= 60:
+                phase_label, phase_conf, phase_desc = WyckoffAnalyzer.classify_phase(
+                    closes, highs, lows, opens, volumes, signals
                 )
-                result["phase"] = phase
-                result["phase_detail"] = phase_detail
+                result["phase"] = phase_label
+                result["phase_conf"] = phase_conf
+                result["phase_detail"] = phase_desc
+            else:
+                phase_label = "数据不足"
+
+            # 第3步：按阶段过滤 signals
+            PHASE_SIGNAL_MAP = {
+                "Accum_A": ["Accum_Stage"],
+                "Accum_B": ["Spring", "Compression", "Accum_Stage"],
+                "Accum_C": ["Spring", "SOS", "LPS", "Accum_Stage"],
+                "Markup": ["SOS", "LPS", "Markup"],
+                "Distribute_A": ["EVR", "Upthrust"],
+                "Distribute_B": ["Upthrust", "EVR"],
+                "Markdown": ["Spring"],
+                "Range": ["Compression"],
+            }
+            allowed = PHASE_SIGNAL_MAP.get(phase_label, [])
+            signals = [s for s in signals if s[0] in allowed]
+            if not signals:
+                signals = [("-", 0, "")]
+
+            if signals and signals[0][1] > 0:
+                result["wyckoff_sig"] = signals[0][0]
+                result["wyckoff_score"] = signals[0][1]
+                result["wyckoff_detail"] = signals[0][2]
 
             # 形态学检测（双顶/双底/头肩顶底/V转）
             result["pattern_name"] = "-"
@@ -1238,8 +1751,7 @@ class Scanner:
             if len(closes) >= 40:
                 patterns = PatternDetector.analyze_all(
                     np.array(closes), np.array(highs),
-                    np.array(lows), np.array(volumes),
-                    trend=result["trend"]
+                    np.array(lows), np.array(volumes)
                 )
                 if patterns:
                     result["pattern_name"] = patterns[0].name
@@ -1258,7 +1770,7 @@ class Scanner:
             if len(closes) >= 60:
                 try:
                     chan_sig = WyckoffAnalyzer.detect_chan_third_buy(
-                        closes, highs, lows, volumes, trend=result["trend"]
+                        closes, highs, lows, volumes, phase=result.get("phase", "")
                     )
                     if chan_sig:
                         result["chan_third_buy"] = {
@@ -1269,10 +1781,70 @@ class Scanner:
                 except Exception:
                     pass
 
-        except Exception:
-            pass
+            # 多因子评分（factor_7_validate 补充缺失因子）
+            if len(closes) >= 30 and _FACTOR7_OK:
+                try:
+                    data_dict = {
+                        "close": np.array(closes),
+                        "high": np.array(highs),
+                        "low": np.array(lows),
+                        "vol": np.array(volumes),
+                        "open": np.array(opens),
+                    }
+                    mkt = getattr(self, "_market_close_arr", None)
+                    f7 = compute_factors_for_stock(data_dict, len(closes) - 1, mkt)
+                    if f7:
+                        result["_factor_scores"] = f7
+                    # 混沌元信息
+                    try:
+                        from factor_7_validate import compute_chaos_meta_for_stock
+                        result["_chaos_meta"] = compute_chaos_meta_for_stock(data_dict, len(closes) - 1)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+        except Exception as e:
+            import traceback
+            print(f"[WARN] _analyze_stock({code}): {e}")
+            traceback.print_exc()
+
+        # 保存OHLCV数组用于Spring质量评分
+        if _SPRING_QUALITY_OK and len(closes) >= 30:
+            result["_ohlcv"] = {
+                "closes": closes, "highs": highs, "lows": lows, "volumes": volumes
+            }
 
         return result
+
+    def _enrich_spring_quality(self, results):
+        """对Spring信号个股计算质量评分（后处理，需市场数据已加载）"""
+        if not _SPRING_QUALITY_OK:
+            return results
+        mkt = getattr(self, "_market_close_arr", None)
+        if mkt is None or len(mkt) < 20:
+            return results
+        enriched = 0
+        for r in results:
+            sig = r.get("wyckoff_sig", "")
+            if "Spring" not in sig:
+                continue
+            ohlcv = r.get("_ohlcv")
+            if not ohlcv:
+                continue
+            try:
+                quality = compute_confidence(
+                    ohlcv["closes"], ohlcv["highs"], ohlcv["lows"],
+                    ohlcv["volumes"], r.get("trend", ""), mkt
+                )
+                r["spring_quality"] = quality
+                enriched += 1
+            except Exception:
+                pass
+        if enriched:
+            sys.stdout.write(f"\r  Spring质量评分: {enriched}只\n")
+            sys.stdout.flush()
+        return results
 
     def enrich_with_financials(self, stocks_with_sigs, max_items=None):
         """对威科夫信号股票补充基本面（PE/PB/ROE/市值）+ 筹码分布"""
@@ -1350,9 +1922,23 @@ class Scanner:
         stock_interval = analysis_cfg.get("stock_interval", 0.02)
         results = []
         total = min(len(self.candidates), max_stocks)
+        sector_cache = {}  # 行业评分本地缓存
 
         for i, stock in enumerate(self.candidates[:max_stocks]):
             analysis = self._analyze_stock(stock["code"])
+            # 补充板块热度评分（用于 Kelly 仓位计算）
+            ind = analysis.get("industry", "")
+            if ind and ind != "其他":
+                if ind not in sector_cache:
+                    try:
+                        from sector_heat import analyze as sector_analyze
+                        sr = sector_analyze(ind)
+                        sector_cache[ind] = sr.get("composite", 50)
+                    except Exception:
+                        sector_cache[ind] = 50
+                analysis["sector_score"] = sector_cache.get(ind, 50)
+            else:
+                analysis["sector_score"] = 50
             results.append({**stock, **analysis})
             if (i + 1) % 10 == 0 and total > 10:
                 sys.stdout.write(f"\r  分析进度: {i+1}/{total}")
@@ -1363,21 +1949,114 @@ class Scanner:
             sys.stdout.write(f"\r  分析进度: {total}/{total}\n")
             sys.stdout.flush()
 
-        # 排序：三买 > 威科夫信号得分 > 多头 > 成交额
+        # 市场数据获取（Spring quality + 多因子评分都需要，提前到 _enrich_spring_quality 之前）
+        if not getattr(self, "_market_close_arr", None):
+            try:
+                index_key = "sh000001"
+                url = self.TENCENT_KLINE_URL.format(code=index_key)
+                r = requests.get(url, timeout=15)
+                data = r.json()
+                klines = data.get("data", {}).get(index_key, {}).get("qfqday") or []
+                index_closes = [float(k[2]) for k in klines if k[2]]
+                if len(index_closes) > 20:
+                    self._market_close_arr = np.array(index_closes)
+            except Exception:
+                pass
+
+        # Spring 信号质量评分（需市场数据，先于 _post_process_scores 执行）
+        results = self._enrich_spring_quality(results)
+
+        # 将 Spring quality bonus 加到 wyckoff_score（走正常加权路径）
+        # 回测结论：>=80 高胜率 bonus +20，<40 confidence 不加bonus（低质量Spring自然低排名）
+        for r in results:
+            sq = r.get("spring_quality", {})
+            bonus = sq.get("bonus", 0) if sq else 0
+            if bonus:
+                r["wyckoff_score"] = min(100, r.get("wyckoff_score", 50) + bonus)
+
+        # 基本面数据提前获取（仅限高分股票，最多 15 只，~4.5s 开销）
+        top_by_wyckoff = sorted(results, key=lambda x: -x.get("wyckoff_score", 0))
+        top_candidates = [r for r in top_by_wyckoff if r.get("wyckoff_sig", "-") not in ("-", "无信号", "数据不足", "无数据")][:15]
+        if top_candidates:
+            enriched = self.enrich_with_financials(top_candidates, max_items=15)
+            enriched_codes = {r["code"] for r in enriched}
+            for r in results:
+                if r["code"] in enriched_codes:
+                    fin_data = next((e for e in enriched if e["code"] == r["code"]), {})
+                    for k in ("pe", "pb", "roe", "total_mv", "chip_support", "chip_resistance"):
+                        if k in fin_data:
+                            r[k] = fin_data[k]
+
+        # 多因子系统评分后处理（此时 wyckoff_score 已含 Spring quality bonus）
+        results = self._post_process_scores(results)
+
+        # 权重快照
+        tf_coeffs = {3: 1.15, 2: 1.00, 1: 0.85, 0: 0.60}
+        src = getattr(self, "_weight_source", "base")
+        snapshot = f"权重来源: {src} | TF系数: tf3={tf_coeffs.get(3):.2f} tf2={tf_coeffs.get(2):.2f} tf1={tf_coeffs.get(1):.2f} tf0={tf_coeffs.get(0):.2f} | {datetime.now().strftime('%m-%d %H:%M')}"
+        self._weight_snapshot = snapshot
+
+        # 保存检查点（防止后续步骤崩溃丢数据）
+        try:
+            self._save_checkpoint()
+        except Exception:
+            pass
+
+        # 排序：三买 > 系统分 > 威科夫信号得分 > 阶段 > 成交额
         def sort_key(x):
             c3 = 0
             cb = x.get("chan_third_buy")
             if cb and cb["signal"] == "三买":
-                c3 = -100  # 三买优先展示
+                c3 = -100
             elif cb and cb["signal"] == "弱三买":
                 c3 = -50
+            ss = -x.get("system_score", x["wyckoff_score"])
             ws = -x["wyckoff_score"]
-            tr = 0 if x["trend"] == "多头" else 1
-            return (c3, ws, tr, -x["amount"])
+            phase_rank = {"Markup": 0, "Accum_B": 1, "Accum_C": 1, "Accum_A": 2,
+                          "Range": 3, "Dist_A": 4, "Dist_B": 4,
+                          "Distribute_A": 4, "Distribute_B": 4, "Markdown": 5}
+            pr = phase_rank.get(x.get("phase", ""), 6)
+            return (c3, ss, ws, pr, -x["amount"])
 
         results.sort(key=sort_key)
+
+        # 行业中性化：同行业最多取 top_n × 15% 只，避免板块扎堆
+        top_n = max_stocks or len(results)
+        max_per_industry = max(1, int(top_n * 0.15))
+        ind_count = {}
+        filtered = []
+        for r in results:
+            ind = r.get("industry", "其他")
+            cnt = ind_count.get(ind, 0)
+            if cnt >= max_per_industry:
+                continue
+            ind_count[ind] = cnt + 1
+            filtered.append(r)
+        results = filtered
+
         self.results = results
         return results
+
+    # ==================== 检查点保存 ====================
+
+    def _save_checkpoint(self):
+        """将当前 results 保存到临时检查点文件，防止后续步骤崩溃丢数据"""
+        if not hasattr(self, "results") or not self.results:
+            return
+        cp = os.path.join(os.path.dirname(__file__), "results_checkpoint.json")
+        minimal = []
+        for r in self.results:
+            minimal.append({
+                "code": r.get("code", ""),
+                "name": r.get("name", ""),
+                "wyckoff_sig": r.get("wyckoff_sig", ""),
+                "wyckoff_score": r.get("wyckoff_score", 0),
+                "trend": r.get("trend", ""),
+                "price": r.get("price", 0),
+                "industry": r.get("industry", ""),
+            })
+        with open(cp, "w", encoding="utf-8") as f:
+            json.dump(minimal, f, ensure_ascii=False, indent=2)
 
     # ==================== 持仓/股票池分析 ====================
 
@@ -1457,7 +2136,222 @@ class Scanner:
             pass
         return []
 
+    # ─── 高级模块状态摘要 ───
+
+    def _advanced_modules_summary(self) -> str:
+        """收集 Bayesian / Kelly / RMT / 因子权重 等模块的状态"""
+        parts = []
+
+        # Bayesian 置信度
+        if _BAYES_OK:
+            try:
+                bc = BayesianConfidence()
+                rpt = bc.report()
+                overall = rpt.get("overall", {}).get("mean", 0.5)
+                total_trades = rpt.get("overall", {}).get("total", 0)
+                parts.append(f"贝叶斯:{overall:.0%}({total_trades}次)")
+            except Exception:
+                parts.append("贝叶斯:--")
+
+        # Kelly 仓位参考
+        if _KELLY_OK:
+            try:
+                stats = load_factor_stats()
+                kelly_pcts = []
+                for k, v in stats.items():
+                    wr = v.get("win_rate", 0.5)
+                    aw = v.get("avg_win", 3.0)
+                    al = v.get("avg_loss", 2.0)
+                    f = kelly_fraction(wr, aw, al)
+                    kelly_pcts.append(f)
+                avg_kelly = np.mean(kelly_pcts) if kelly_pcts else 0
+                parts.append(f"Kelly:{avg_kelly:.0%}")
+            except Exception:
+                parts.append("Kelly:--")
+
+        # RMT + 因子权重偏离
+        if _WEIGHTS_OK:
+            try:
+                base = BASE_WEIGHTS
+                eff = get_weights()
+                changed = []
+                for k in base:
+                    if k in eff:
+                        diff = eff[k] - base[k]
+                        if abs(diff) >= 0.01:
+                            changed.append(f"{k}{eff[k]:.0%}")
+                parts.append(f"权重调整:{' '.join(changed) if changed else '无'}")
+            except Exception:
+                parts.append("权重调整:--")
+
+        if not parts:
+            return ""
+
+        return "  [系统状态] " + " | ".join(parts)
+
+    def _chaos_summary(self, results) -> str:
+        """提取混沌状态摘要"""
+        chaos_ok = sum(1 for r in results if r.get("_chaos_meta"))
+        if not chaos_ok:
+            return ""
+        # 取 top5 的混沌特征均值
+        metas = [r["_chaos_meta"] for r in results[:5] if r.get("_chaos_meta")]
+        if not metas:
+            return ""
+        avg_snr = np.mean([m.get("snr_db", 0) for m in metas])
+        avg_svd = np.mean([m.get("svd_entropy", 0.5) for m in metas])
+        avg_npe = np.mean([m.get("npe_ratio", 1.0) for m in metas])
+        avg_conf = np.mean([m.get("structure_confidence", 0) for m in metas])
+        return "  [混沌状态] 个股可预测:{:.0%} 信噪比:{:.0f}dB 熵:{:.2f} NPE:{:.2f}".format(
+            avg_conf, avg_snr, avg_svd, avg_npe)
+
+    # ─── 因子名称到权重名称的映射 ───
+
+    _F2W_MAP = {
+        "risk_reward": "risk_reward",
+        "volume": "volume",
+        "candlestick": "candlestick",
+        "trend_momentum": "tech_strength",
+        "relative_strength": "relative_strength",
+        "volatility": "volatility",
+        "orbit_compression": "orbit_compression",
+        "lyapunov": "lyapunov",
+        "hurst": "hurst",
+        "fractal_dim": "fractal_dim",
+        "attractor_shape": "attractor_shape",
+    }
+
+    # ─── 系统评分后处理（RMT权重 + 贝叶斯） ───
+
+    def _post_process_scores(self, results):
+        """
+        对每只结果应用 RMT 因子权重 + 贝叶斯置信度，生成 system_score。
+        同时写入 Kelly 建议仓位和策略建议。
+        """
+        # 1) 获取 RMT 权重和贝叶斯因子权重调整（市场数据已在 _run_scan 中获取）
+        weights = None
+        bayes_adj = {}
+
+        if _WEIGHTS_OK:
+            try:
+                weights = get_weights()
+                self._weight_source = "RMT"
+            except Exception:
+                weights = None
+                self._weight_source = "base"
+        if _BAYES_OK:
+            try:
+                bc = BayesianConfidence()
+                bayes_adj = bc.factor_weight_adjustment()
+            except Exception:
+                pass
+
+        # 3) 遍历结果计算 system_score
+        for r in results:
+            fs = r.get("_factor_scores", {})
+            wyckoff = r.get("wyckoff_score", 50)
+
+            if fs and weights:
+                weighted_sum = 0.0
+                total_w = 0.0
+                for factor_name, weight_name in self._F2W_MAP.items():
+                    w = weights.get(weight_name, 0)
+                    if w > 0:
+                        w *= bayes_adj.get(weight_name, 1.0)  # 贝叶斯因子级调整
+                        f_val = fs.get(factor_name, 50)
+                        weighted_sum += f_val * w
+                        total_w += w
+                # 将 wyckoff 分作为额外加权项（用权重的均值作为其权重）
+                wyckoff_w = np.mean(list(weights.values())) if weights else 0.15
+                weighted_sum += wyckoff * wyckoff_w
+                total_w += wyckoff_w
+
+                factor_score = weighted_sum / total_w if total_w > 0 else wyckoff
+                factor_score = max(0, min(100, factor_score))
+                r["system_score"] = round(factor_score, 1)
+            else:
+                # 回退到原有的 wyckoff_score
+                r["system_score"] = float(wyckoff)
+
+            # 5) 三重滤网调整: 基于回测数据 (2026-06-01, t=3.34显著)
+            # tf=3:+0.70%/周 → ×1.15, tf=2:+0.14% → ×1.00
+            # tf=1:+0.18% → ×0.85, tf=0:-0.02% → ×0.60
+            tf = r.get("tf_score", 0)
+            tf_coeffs = {3: 1.15, 2: 1.00, 1: 0.85, 0: 0.60}
+            coeff = tf_coeffs.get(tf, 1.0)
+            r["system_score"] = min(100, r["system_score"] * coeff) if tf == 3 else r["system_score"] * coeff
+            r["system_score"] = round(r["system_score"], 1)
+
+            # 5b) 基本面微调（低 PE 加分，高 ROE 加分）
+            pe = r.get("pe")
+            roe = r.get("roe")
+            adj = 0
+            if pe is not None and pe > 0:
+                if pe < 15:
+                    adj += 3
+                elif pe > 40:
+                    adj -= 3
+            if roe is not None:
+                if roe > 15:
+                    adj += 3
+            if adj:
+                r["system_score"] = min(100, max(0, r["system_score"] + adj))
+                r["system_score"] = round(r["system_score"], 1)
+
+            # 6) Kelly 仓位建议（完整版: compute_kelly_position）
+            r["kelly_pct"] = 0.0
+            if _KELLY_OK:
+                try:
+                    fs = r.get("_factor_scores", {})
+                    # 构建 factors 列表 (breakdown_lines 格式)
+                    kelly_factors = []
+                    for factor_name, weight_name in self._F2W_MAP.items():
+                        w = weights.get(weight_name, 0) if weights else 0
+                        if w > 0:
+                            fv = fs.get(factor_name, {})
+                            f_score = fv.get("score", fv) if isinstance(fv, dict) else (fv if isinstance(fv, (int, float)) else 50)
+                            item = {"key": weight_name, "weight": w, "score": f_score}
+                            if factor_name == "risk_reward":
+                                fv = fs.get(factor_name, 50)
+                                f_score = fv if isinstance(fv, (int, float)) else fv.get("score", 50)
+                                # 反向映射 score → ratio: scoring.py 映射表
+                                rr_score_to_ratio = {95: 3.5, 80: 2.5, 65: 2.0, 50: 1.5, 35: 1.0, 20: 0.5, 10: 0.3}
+                                rr_ratio = rr_score_to_ratio.get(round(f_score / 10) * 10, 1.5)
+                                item = {"key": weight_name, "weight": w, "score": f_score, "ratio": rr_ratio}
+                            kelly_factors.append(item)
+                    # TF 调整也应用到 Kelly 因子分，与 system_score 保持一致
+                    if coeff != 1.0:
+                        for f_item in kelly_factors:
+                            f_item["score"] = min(100, f_item["score"] * coeff)
+                    kelly_result = compute_kelly_position(
+                        r["system_score"], kelly_factors,
+                        market_score=getattr(self, "_market_score", 50),
+                        sector_score=r.get("sector_score", 50)
+                    )
+                    r["kelly_pct"] = round(kelly_result["position_factor"], 2)
+                except Exception:
+                    r["kelly_pct"] = 0.0
+
+        return results
+
+    # ==================== 报告输出 ====================
+
     def print_report(self, top_n=15):
+        import socket as _sckt
+        _old_to = _sckt.getdefaulttimeout()
+        _sckt.setdefaulttimeout(8)
+
+        # === monkey-patch: requests 全局 timeout (防Tushare/AKShare挂死) ===
+        import requests as _req
+        if not getattr(_req.Session, '_patched_timeout', False):
+            _orig_request = _req.Session.request
+            def _patched_request(self, method, url, **kwargs):
+                kwargs.setdefault('timeout', (5, 8))
+                return _orig_request(self, method, url, **kwargs)
+            _req.Session.request = _patched_request
+            _req.Session._patched_timeout = True
+        # ================================================================
+
         bullish = sum(1 for r in self.results if r["trend"] == "多头")
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -1500,6 +2394,8 @@ class Scanner:
         print("\n" + "=" * 80)
         print(f"  A股扫描报告  {now}")
         print("=" * 80)
+        if hasattr(self, "_weight_snapshot"):
+            print(f"  [{self._weight_snapshot}]")
         print(f"  覆盖: {len(self.all_stocks)} 只  流动性通过: {len(self.candidates)} 只")
         print(f"  多头: {bullish}只  ", end="")
         for k, v in sig_counts.items():
@@ -1513,13 +2409,74 @@ class Scanner:
             passed = sum(1 for r in quality_checked if r["quality_passed"])
             pct = passed / len(quality_checked) * 100
             print(f"\n  质地检查: {len(quality_checked)}只 通过{passed}只 ({pct:.0f}%)", end="")
-        print("\n")
+
+        # 大盘健康状况（提前计算用于判断）
+        try:
+            from market import MarketAnalyzer
+            indices = MarketAnalyzer.fetch_indices()
+        except Exception:
+            indices = {}
+        breadth = self._calc_breadth()
+
+        # 综合健康判断（显示在最顶部）
+        health_p = 0
+        health_w = 0
+        if indices:
+            avg_chg = np.mean([i["change_pct"] for i in indices.values()])
+            if avg_chg >= 0.5: health_p += 1
+            elif avg_chg <= -0.5: health_w += 1
+        if breadth:
+            if breadth["ad_ratio"] >= 1.5: health_p += 1
+            elif breadth["ad_ratio"] < 0.8: health_w += 1
+            if breadth["ul_ratio"] >= 3: health_p += 1
+            elif breadth["ul_ratio"] < 1: health_w += 1
+        hl_score = health_p - health_w
+        if hl_score >= 2: hl = "健康 — 可积极参与"
+        elif hl_score >= 1: hl = "较好 — 精选个股操作"
+        elif hl_score >= 0: hl = "一般 — 注意仓位管理"
+        elif hl_score >= -1: hl = "偏弱 — 建议降低仓位"
+        else: hl = "较差 — 防守为主"
+        breadth_data = breadth or {}
+        # 综合判断
+        print(f"\n  {'='*60}")
+        print(f"  >>> 大盘综合判断: {hl}")
+
+        # 指数 + 涨跌（一行）
+        idx_line = ""
+        if indices:
+            for key in ["sh000001", "sz399001", "sz399006", "sh000688"]:
+                idx = indices.get(key)
+                if idx: idx_line += f"{idx['name']}{idx['change_pct']:+.2f}% "
+        bd = breadth_data
+        if bd:
+            ad = bd.get("ad_ratio", 0)
+            up = bd.get("up", 0); down = bd.get("down", 0)
+            lu = bd.get("limit_up", 0); ld = bd.get("limit_down", 0)
+            ad_label = "普涨" if ad >= 2 else ("涨多跌少" if ad >= 1.2 else ("偏弱" if ad >= 0.8 else "极弱"))
+            idx_line += f"| 涨跌:{up}/{down}({ad_label}) 涨停:{lu} 跌停:{ld}"
+        try:
+            pe_info, cap = MarketAnalyzer.get_pe_percentile()
+            if pe_info: idx_line += f" | PE{pe_info['pe']} {pe_info['percentile']}%分位"
+        except Exception:
+            pass
+        print(f"  指数: {idx_line}")
+        print(f"  {'='*60}\n")
+
+        # 高级模块状态
+        sys_status = self._advanced_modules_summary()
+        if sys_status:
+            print(sys_status)
+
+        # 混沌状态摘要
+        chaos_line = self._chaos_summary(self.results)
+        if chaos_line:
+            print(chaos_line)
 
         if not self.results:
             print("  无符合条件标的")
             return
 
-        # === 市场情绪指标（三层） ===
+        # === 市场情绪（压缩到一行） ===
         if _SENTIMENT_TOOL:
             try:
                 d = get_daily_sentiment()
@@ -1531,98 +2488,9 @@ class Scanner:
                     return " | ".join(f"{it['name']}{it['value']}[{it['level']}]" for it in items)
 
                 mom_icon = {"升温": "↗", "降温": "↘", "持平": "→"}.get(w["momentum"], "")
-                print(f"  ══ 市场情绪 ══  综合:{c['score']}[{c['level']}]")
-                print(f"  日频: {d['score']}[{d['level']}]  {items_line(d['items'])}")
-                print(f"  周频: {w['score']}[{w['level']}]  {mom_icon}Δ{w['delta']:+d}  {items_line(w['items'])}")
-                print(f"  月频: {m['score']}[{m['level']}]  {items_line(m['items'])}")
-                print()
+                print(f"  情绪: 综合{c['score']}[{c['level']}] | 日{d['score']}[{d['level']}] {items_line(d['items'])} | 周{w['score']}[{w['level']}] {mom_icon}Δ{w['delta']:+d}")
             except Exception:
                 pass
-
-        # === 大盘健康状况 ===
-        try:
-            from market import MarketAnalyzer
-            indices = MarketAnalyzer.fetch_indices()
-        except Exception:
-            indices = {}
-
-        breadth = self._calc_breadth()
-
-        print(f"  【大盘健康状况】")
-        # 指数
-        idx_line = ""
-        if indices:
-            for key in ["sh000001", "sz399001", "sz399006", "sh000688"]:
-                idx = indices.get(key)
-                if idx:
-                    idx_line += f"{idx['name']}{idx['change_pct']:+.2f}% "
-        print(f"  指数: {idx_line}")
-
-        # 涨跌统计
-        if breadth:
-            ad = breadth.get("ad_ratio", 0)
-            up = breadth.get("up", 0)
-            down = breadth.get("down", 0)
-            lu = breadth.get("limit_up", 0)
-            ld = breadth.get("limit_down", 0)
-            # 判断涨跌状态
-            if ad >= 2:
-                ad_label = "普涨格局"
-            elif ad >= 1.2:
-                ad_label = "涨多跌少"
-            elif ad >= 0.8:
-                ad_label = "偏弱"
-            else:
-                ad_label = "极弱"
-            if lu > ld * 3 and lu > 30:
-                emo_label = "做多情绪强"
-            elif lu > ld:
-                emo_label = "正常"
-            else:
-                emo_label = "做空占优"
-
-            print(f"  涨跌: {up}涨/{down}跌  (涨跌比{ad}, {ad_label})")
-            print(f"  涨停: {lu}只  跌停: {ld}只  ({emo_label})")
-
-        # PE分位
-        try:
-            pe_info, cap = MarketAnalyzer.get_pe_percentile()
-            if pe_info:
-                print(f"  估值: PE {pe_info['pe']} 近5年{pe_info['percentile']}%分位 ({pe_info['level']})")
-        except Exception:
-            pass
-
-        # 综合健康判断
-        health_p = 0
-        health_w = 0
-        if indices:
-            avg_chg = np.mean([i["change_pct"] for i in indices.values()])
-            if avg_chg >= 0.5:
-                health_p += 1
-            elif avg_chg <= -0.5:
-                health_w += 1
-        if breadth:
-            if breadth["ad_ratio"] >= 1.5:
-                health_p += 1
-            elif breadth["ad_ratio"] < 0.8:
-                health_w += 1
-            if breadth["ul_ratio"] >= 3:
-                health_p += 1
-            elif breadth["ul_ratio"] < 1:
-                health_w += 1
-        score = health_p - health_w
-        if score >= 2:
-            hl = "健康 — 可积极参与"
-        elif score >= 1:
-            hl = "较好 — 精选个股操作"
-        elif score >= 0:
-            hl = "一般 — 注意仓位管理"
-        elif score >= -1:
-            hl = "偏弱 — 建议降低仓位"
-        else:
-            hl = "较差 — 防守为主"
-        print(f"  综合判断: {hl}")
-        print()
 
         # === 热门板块轮动 ===
         sectors = {}
@@ -1649,7 +2517,11 @@ class Scanner:
             # 热度
             heat_str = "-"
             try:
-                heat = get_sector_heat(ind)
+                import functools
+                @functools.lru_cache(maxsize=32)
+                def _cached_heat(name):
+                    return get_sector_heat(name)
+                heat = _cached_heat(ind)
                 if heat and heat.get("composite"):
                     heat_str = f"{heat['composite']}"
             except Exception:
@@ -1755,15 +2627,15 @@ class Scanner:
                         net = hi.get('top_list', {}).get('net_amount', 0)
                         lhb_str = f"净{net:+.2f}亿" if net else "上榜"
                     # 建议规则
-                    sug = "持有"
+                    sug = "▶ 持有"
                     if s["trend"] == "空头":
-                        sug = "减仓/止损"
+                        sug = "▼ 警惕止损"
                     elif s["wyckoff_sig"] in ("Upthrust",) and s.get("pnl_pct", 0) is not None and s["pnl_pct"] > 5:
-                        sug = "减仓"
+                        sug = "▼ 减仓"
                     elif s["wyckoff_sig"] in ("Spring", "SOS", "LPS"):
-                        sug = "加仓/持有"
+                        sug = "▲ 加仓/持有"
                     elif s.get("pnl_pct") is not None and s["pnl_pct"] < -15:
-                        sug = "警惕止损"
+                        sug = "!! 止损"
                     print(f"  {sym:<8} {nn:<8} {tr:<8} {sg:<16} {pr:<8} {cost:<8} {pnl:<8} {lhb_str:<10} {sug:<12}")
                 print()
 
@@ -1802,8 +2674,8 @@ class Scanner:
 
         # === Top N ===
         print(f"  [Top {top_n}]")
-        print(f"  {'#':<3} {'代码':<8} {'名称':<7} {'板块':<12} {'趋势':<10} {'威科夫':<18} {'形态':<16} {'三买':<14} {'价格':<8} {'成交额':<8} {'质地':<6}")
-        print(f"  " + "-" * 140)
+        print(f"  {'#':<3} {'代码':<8} {'名称':<7} {'板块':<12} {'趋势':<10} {'威科夫':<18} {'系统分':<6} {'盈亏比':<6} {'三滤':<4} {'量信':<4} {'价格':<8} {'成交额':<8} {'Kelly':<6} {'质地':<6}")
+        print(f"  " + "-" * 136)
 
         for i, r in enumerate(self.results[:top_n]):
             sym = r["code"].split(".")[1]
@@ -1825,22 +2697,46 @@ class Scanner:
             sc = r["wyckoff_score"]
             sig_str = f"{sig}({sc})" if sig not in ("-", "无信号") else sig
 
-            # 形态信号
-            pn = r.get("pattern_name", "-")
-            ps = r.get("pattern_score", 0)
-            p_str = f"{pn}({ps})" if pn != "-" else "-"
+            # 系统分（多因子加权 + RMT + 贝叶斯 + 三重滤网）
+            ss = r.get("system_score", sc)
+            ss_str = f"{ss:.0f}" if isinstance(ss, (int, float)) else "-"
+            # 盈亏比因子
+            fs = r.get("_factor_scores", {})
+            rr_val = fs.get("risk_reward", fs.get("盈亏比", None)) if isinstance(fs, dict) else None
+            rr_str = f"{rr_val:.0f}" if isinstance(rr_val, (int, float)) else "-"
 
-            # 三买信号
-            cb = r.get("chan_third_buy")
-            cb_str = "-"
-            if cb:
-                cb_str = f"{cb['signal']}({cb['score']})" if cb.get("detail") else cb["signal"]
+            # 三重滤网状态
+            m = r.get("tf_monthly", "-")
+            w = r.get("tf_weekly", "-")
+            d = r.get("tf_daily", "-")
+            tf_str = f"{m}{w}{d}"
+
+            # Kelly 仓位建议
+            kp = r.get("kelly_pct", 0)
+            kelly_str = f"{kp:.0%}" if isinstance(kp, (int, float)) else "-"
+
+            # Spring 质量置信度
+            sq = r.get("spring_quality", {})
+            sq_conf = sq.get("confidence", 0) if sq else 0
+            sq_str = f"{sq_conf:.0f}" if "Spring" in r.get("wyckoff_sig", "") and sq_conf > 0 else "-"
 
             price = f"{r['price']:.2f}"
             amt = f"{r['amount']/1e8:.1f}亿"
             qf = "通过" if r.get("quality_passed") else ("未检" if r.get("quality_passed") is None else "未过")
-            print(f"  {i+1:<3} {sym:<8} {name:<7} {ind:<12} {trend:<10} {sig_str:<18} {p_str:<16} {cb_str:<14} {price:<8} {amt:<8} {qf:<6}")
+            marker = ">>" if i < 3 else "  "
+            print(f"  {marker}{i+1:<3} {sym:<8} {name:<7} {ind:<12} {trend:<10} {sig_str:<18} {ss_str:<6} {rr_str:<6} {tf_str:<4} {sq_str:<4} {price:<8} {amt:<8} {kelly_str:<6} {qf:<6}")
 
+        # 三重滤网统计
+        tf_counts = {}
+        for r in self.results:
+            m = r.get("tf_monthly", "?")
+            w = r.get("tf_weekly", "?")
+            d = r.get("tf_daily", "?")
+            tag = f"{m}{w}{d}"
+            tf_counts[tag] = tf_counts.get(tag, 0) + 1
+        print(f"  三重滤网分布: " +
+              " | ".join(f"{k}={v}只" for k, v in sorted(tf_counts.items(),
+                       key=lambda x: (sum(1 for c in x[0] if c == '多'), -x[1]), reverse=True)))
         print()
 
         # === 缠论三买执行信号 ===
@@ -1889,18 +2785,20 @@ class Scanner:
 
                 if buy_sigs:
                     print(f"  【买入关注 — Spring/SOS/LPS】质地通过 {len(buy_sigs)}只")
-                    print(f"  {'信号':<12} {'代码':<8} {'名称':<7} {'板块':<12} {'得分':<5} {'PE':<7} {'ROE':<6} {'细节':<24}")
-                    print(f"  " + "-" * 88)
+                    print(f"  {'信号':<12} {'代码':<8} {'名称':<7} {'板块':<12} {'得分':<5} {'可信':<5} {'PE':<7} {'ROE':<6} {'细节':<24}")
+                    print(f"  " + "-" * 95)
                     for r in buy_sigs:
                         sym = r["code"].split(".")[1]
                         name = r["name"][:6]
                         ind = r.get("industry", "其他")[:10]
                         sig = r["wyckoff_sig"]
                         sc = r["wyckoff_score"]
+                        sq = r.get("spring_quality", {})
+                        sq_str = f"{sq['confidence']:.0f}" if sq.get("confidence") else "-"
                         pe = f"{r['pe']:.1f}" if r.get("pe") else "-"
                         roe = f"{r['roe']:.1f}%" if r.get("roe") else "-"
                         detail = r.get("wyckoff_detail", "")[:24]
-                        print(f"  {sig:<12} {sym:<8} {name:<7} {ind:<12} {sc:<5} {pe:<7} {roe:<6} {detail:<24}")
+                        print(f"  {sig:<12} {sym:<8} {name:<7} {ind:<12} {sc:<5} {sq_str:<5} {pe:<7} {roe:<6} {detail:<24}")
                     print()
 
                 if sell_sigs:
@@ -2016,6 +2914,8 @@ class Scanner:
                     print()
             except Exception:
                 pass
+
+        _sckt.setdefaulttimeout(_old_to)
 
     # ==================== 飞书推送 ====================
 
@@ -2181,6 +3081,16 @@ class Scanner:
                     "industry": self.get_industry(s["code"]),
                 })
         else:
+            # 加载大盘情绪（涨停家数/连板高度/炸板率，补充大盘因子输入）
+            try:
+                from market_sentiment import get_market_sentiment
+                ms = get_market_sentiment()
+                self._market_score = ms["score"]
+                self._market_sentiment_detail = ms
+                print(f"  大盘情绪: {ms['score']}分 [{ms['label']}] 涨停{ms['zting_count']}家 连板{ms['high_board']}板 炸板{ms['zha_ban_rate']:.0%}")
+            except Exception:
+                pass
+
             print("[3/3] 威科夫+趋势分析...")
             t0 = time.time()
             self.run_analysis(max_analysis)
@@ -2190,9 +3100,9 @@ class Scanner:
             print("[3.5/3] 个股质地检查 (Tushare)...")
             self.enrich_with_quality(self.results)
 
-            # [4/4] 持仓/股票池分析
-            print("[4/4] 持仓+股票池分析...")
-            self.analyze_watchlist()
+        # 无论 quick/full 都分析股票池+持仓
+        print("[4/4] 持仓+股票池分析...")
+        self.analyze_watchlist()
 
         self.print_report(top_n)
 
@@ -2220,6 +3130,41 @@ class Scanner:
             pool = self.watchlist_results.get("pool", []) if hasattr(self, "watchlist_results") else []
             holdings = self.watchlist_results.get("holdings", []) if hasattr(self, "watchlist_results") else []
             save_scan_result(self.results, pool, holdings, recommendations, indices, top_n)
+
+            # 清理检查点
+            try:
+                cp = os.path.join(os.path.dirname(__file__), "results_checkpoint.json")
+                if os.path.exists(cp):
+                    os.remove(cp)
+            except Exception:
+                pass
+
+        # 上报选股结果到 system_state
+        try:
+            from system_state import report_scanner
+            report_scanner(self.results[:30] if hasattr(self, "results") else [])
+        except Exception:
+            pass
+
+        # 更新 _system_state.md (markdown 状态文件)
+        try:
+            top_n = self._sc.get("report", {}).get("top_n_default", 15)
+            top_picks = []
+            for i, r in enumerate(self.results[:top_n]):
+                code = r["code"].split(".")[1]
+                amount = r.get("amount", 0)
+                amount_str = f"{amount/1e8:.1f}亿" if amount else "0"
+                top_picks.append((
+                    i + 1, code, r["name"], r.get("phase", r.get("trend", "-")), r["wyckoff_sig"],
+                    r["wyckoff_score"], r.get("system_score", r["wyckoff_score"]),
+                    amount_str, r.get("industry", ""),
+                ))
+            update_state_md(
+                scan_date=datetime.now().strftime("%Y-%m-%d %H:%M"),
+                top_picks=top_picks,
+            )
+        except Exception:
+            pass
 
 
 def run_scanner(min_amount=5e8, quick=False):

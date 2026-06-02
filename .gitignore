@@ -1,5 +1,6 @@
 # Claude Code internal
 .claude/
+.agents/
 
 # Python
 __pycache__/
@@ -7,27 +8,22 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-
-# Options
-last_picks.json
-skills-lock.json
+*.egg
 
 # Screenshots
 *.jpg
 *.png
 
 # Data & Cache
+data_cache/
+output/
+output_v2/
 industry_cache.json
 
-# Config with potential secrets (webhook URLs, API keys)
+# Config with secrets (webhook URLs, API keys)
 config/scanner.yaml
 config.json
-
-# Runtime data files
-market_log.json
-predictions.json
-score_log.json
-calibration.json
+.mcp.json
 
 # IDE
 .vscode/
@@ -48,12 +44,48 @@ venv/
 
 # Debug & temp scripts
 debug_*.py
+_check_*.py
+_debug_*.txt
+_verify_*
+_*.py
 
 # Runtime bridge state
 .feishu_*.json
 feishu_bot_output.txt
+bridge_watchdog.vbs
+bridge_watchdog_loop.bat
+start_claude_bridge.vbs
 
 # Generated scan output
 scan_output.txt
 scanner_utf8_output.txt
 *_output.txt
+
+# Reports & reviews
+reports/
+reviews/
+backup/
+*.zip
+
+# Runtime data (auto-generated, not source)
+recommendation_history.json
+signal_vs_market_history.json
+bayesian_confidence.json
+watch_pool_cache.json
+position_cache.json
+system_state.json
+fundamental_pool.json
+ic_rolling_db.json
+ic_decay_alerts.json
+feishu_chat_log.json
+chinaclear_home.html
+
+# Knowledge vault temp files
+tasks/
+prompts/
+
+# Markdown notes (personal, not code)
+*.md
+!README.md
+!docs/*.md
+!rules/*.md

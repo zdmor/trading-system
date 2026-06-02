@@ -62,9 +62,10 @@ def get_factors(df, code):
             h = sdf["high"].values.astype(float)
             l = sdf["low"].values.astype(float)
             v = sdf["volume"].values.astype(float)
+            o = sdf["open"].values.astype(float)
             from scanner import WyckoffAnalyzer
             phase_label, _, _ = WyckoffAnalyzer.detect_phase(c.tolist(), h.tolist(), l.tolist(), v.tolist(), trend_dir, [])
-            wyckoff_sigs, _ = WyckoffAnalyzer.analyze_all(c.tolist(), h.tolist(), l.tolist(), v.tolist(), trend_dir)
+            wyckoff_sigs, _ = WyckoffAnalyzer.analyze_all(c.tolist(), h.tolist(), l.tolist(), o.tolist(), v.tolist())
 
         fin_metrics = get_financial_indicators(code)
         moneyflow = get_stock_moneyflow(code)

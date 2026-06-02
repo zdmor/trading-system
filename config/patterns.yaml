@@ -7,41 +7,25 @@
 # ============================================================
 spring:
   enabled: true
-  # 排除趋势
-  exclude_trends: ["空头", "错误"]
 
-  # 支撑计算窗口（取最低价）
-  support_window: [-12, -3]
-  # 价格在支撑附近的判定范围（倍率）
-  price_range: [0.95, 1.15]
+  # 标准参数集
+  support_window: 30                 # 回溯天数
+  min_touches: 2                    # 最少测试次数
+  support_percentile: 20            # 支撑分位数
 
-  # 基准量窗口
-  volume_baseline_window: [-15, -3]
+  # 严格参数集（Markdown 中假信号多，用更严条件）
+  strict_support_window: 45
+  strict_min_touches: 3
+  strict_percentile: 15
+
   # 检测窗口（最近N根K线中逐根检测）
-  detect_window: [-3, null]
+  detect_window: [-10, null]
 
   scoring:
-    # 探底深度（百分比）
-    depth:
-      - [4.0, 25, "深探{depth:.1f}%"]
-      - [2.0, 20, "中探{depth:.1f}%"]
-      - [0.0, 12, "浅探{depth:.1f}%"]
-    # 量比
-    volume_ratio:
-      - [2.5, 25, "巨量"]
-      - [1.8, 20, "放量"]
-      - [1.2, 12, "微放量"]
-      - [0.0, 5,  "量平"]
-    # 反弹幅度（百分比）
-    bounce:
-      - [5.0, 25, "强弹{bounce:.1f}%"]
-      - [3.0, 18, "中弹{bounce:.1f}%"]
-      - [1.5, 10, "弱弹{bounce:.1f}%"]
-    # 次日确认
-    next_day_confirm: 15
+    max_penetration: 10.0
 
   thresholds:
-    strong_signal: 55  # 以上为Spring
+    strong_signal: 60
     weak_label: "弱Spring"
 
 # ============================================================

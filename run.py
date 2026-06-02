@@ -69,7 +69,8 @@ def analyze_stock(symbol, account_value=80000, position=None, market_health=None
         )
         # 获取全部威科夫信号供评分使用
         wyckoff_all_signals, _ = WyckoffAnalyzer.analyze_all(
-            c.tolist(), h.tolist(), l.tolist(), v.tolist(), trend_dir
+            c.tolist(), h.tolist(), l.tolist(),
+            daily["open"].values.astype(float).tolist(), v.tolist()
         )
 
     # ── 大盘因子数据 ──
