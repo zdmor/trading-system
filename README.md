@@ -160,7 +160,7 @@ Meta-System classifies it as `RESEARCH_REFERENCE / LEGACY_WYCKOFF_RESEARCH_SYSTE
 
 Key themes include Wyckoff/market structure, medium/long-horizon A-share research, risk/feedback/calibration loops, multiple backtest variants, Bayesian confidence/fusion, bull-bear debate, and market/buzz observation. Historical data sources included Tushare Pro, AKShare, Tencent Finance, and Sina Finance; current runnability must be revalidated.
 
-## 4. Main structure and assets
+## 4. Directory structure and assets
 
 Important surfaces include `CHANGELOG.md`, `P1_TASKS.md`, `TEPPER_PLAN.md`, `SZFY_WORKBUDDY_TASK.md`, multiple backtest scripts, Bayesian research modules, `bull_bear_debate.py`, `buzz_monitor.py`, `backup_claude.sh`, and the `docs/` methodology area. The list highlights orientation points rather than duplicating the complete file inventory.
 
